@@ -24,10 +24,16 @@ env/
 *.hdf5
 *.npy
 *.npz
-data/
 
-# 实验输出
-results/
+# 数据目录内容不上传，但保留目录结构
+data/train/*
+data/test/*/*
+!data/train/.gitkeep
+!data/test/**/.gitkeep
+
+# 实验输出（保留目录结构）
+results/**/
+!results/**/.gitkeep
 outputs/
 logs/
 checkpoints/
