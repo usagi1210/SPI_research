@@ -21,10 +21,26 @@ parser.add_argument('--gpu',        type=str,   default='0')
 parser.add_argument('--test_set',   type=str,   default='Set11')
 parser.add_argument('--data_dir',   type=str,   default='../../data/test')
 parser.add_argument('--matrix_dir', type=str,   default='../../matrices')
-parser.add_argument('--ckpt_dir',   type=str,   default='../../results/ours/checkpoints')
-parser.add_argument('--result_dir', type=str,   default='../../results/ours/images')
-parser.add_argument('--log_dir',    type=str,   default='../../results/ours/logs')
+parser.add_argument('--base_dir',   type=str,   default='../../results/ours')
+parser.add_argument('--run_id',     type=str,   default='', help='run timestamp folder; default: auto latest')
 args = parser.parse_args()
+
+def find_latest_run(base_dir):
+    runs = sorted([
+        d for d in os.listdir(base_dir)
+        if os.path.isdir(os.path.join(base_dir, d, 'checkpoints'))
+    ])
+    return runs[-1] if runs else None
+
+run_id = args.run_id
+if not run_id:
+    run_id = find_latest_run(args.base_dir)
+    if run_id is None:
+        raise FileNotFoundError(f'No runs found in {args.base_dir}')
+    print(f'Auto-selected run: {run_id}')
+
+run_dir = os.path.join(args.base_dir, run_id)
+print(f'Run dir: {run_dir}')
 
 os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -51,10 +67,11 @@ Qinit = torch.from_numpy(Qinit_np).to(device)
 # Load model
 # ---------------------------------------------------------------------------
 ckpt_prefix = f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}'
+ckpt_dir    = os.path.join(run_dir, 'checkpoints')
 if args.use_best:
-    ckpt_path = os.path.join(args.ckpt_dir, f'{ckpt_prefix}_best.pth')
+    ckpt_path = os.path.join(ckpt_dir, f'{ckpt_prefix}_best.pth')
 else:
-    ckpt_path = os.path.join(args.ckpt_dir, f'{ckpt_prefix}_epoch{args.epoch_num}.pth')
+    ckpt_path = os.path.join(ckpt_dir, f'{ckpt_prefix}_epoch{args.epoch_num}.pth')
 model = MGSPINet(num_layers=args.num_layers, channels=args.channels)
 model = nn.DataParallel(model).to(device)
 model.load_state_dict(torch.load(ckpt_path, map_location=device))
@@ -69,9 +86,10 @@ img_paths = sorted(glob.glob(os.path.join(test_dir, '*.tif')) +
                    glob.glob(os.path.join(test_dir, '*.png')) +
                    glob.glob(os.path.join(test_dir, '*.bmp')))
 
-save_dir = os.path.join(args.result_dir, args.test_set, f'ratio_{args.cs_ratio}')
+save_dir = os.path.join(run_dir, 'images', args.test_set, f'ratio_{args.cs_ratio}')
+log_dir  = os.path.join(run_dir, 'logs')
 os.makedirs(save_dir, exist_ok=True)
-os.makedirs(args.log_dir, exist_ok=True)
+os.makedirs(log_dir,  exist_ok=True)
 
 psnr_list, ssim_list = [], []
 print(f'\nTesting MGSPINet | {args.test_set} | ratio={args.cs_ratio}% | {len(img_paths)} images\n')
@@ -118,6 +136,6 @@ summary  = (f'\nAvg PSNR={avg_psnr:.2f}  Avg SSIM={avg_ssim:.4f} '
             f'| set={args.test_set}  ratio={args.cs_ratio}%  epoch={args.epoch_num}\n')
 print(summary)
 
-log_path = os.path.join(args.log_dir, f'test_{args.test_set}_ratio{args.cs_ratio}.txt')
+log_path = os.path.join(log_dir, f'test_{args.test_set}_ratio{args.cs_ratio}.txt')
 with open(log_path, 'a') as f:
     f.write(summary)

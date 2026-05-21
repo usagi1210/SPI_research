@@ -2,6 +2,7 @@ import os
 import glob
 import platform
 import argparse
+from datetime import datetime
 import numpy as np
 import scipy.io as sio
 import cv2
@@ -22,12 +23,19 @@ parser.add_argument('--batch_size',   type=int,   default=64)
 parser.add_argument('--gpu',          type=str,   default='0')
 parser.add_argument('--data_dir',     type=str,   default='../../data/train/BSD400')
 parser.add_argument('--matrix_dir',   type=str,   default='../../matrices')
-parser.add_argument('--ckpt_dir',     type=str,   default='../../results/ours/checkpoints')
-parser.add_argument('--log_dir',      type=str,   default='../../results/ours/logs')
+parser.add_argument('--result_dir',   type=str,   default='../../results/ours')
+parser.add_argument('--run_id',       type=str,   default='', help='run identifier (default: auto timestamp)')
 parser.add_argument('--resume_epoch', type=int,   default=0)
+parser.add_argument('--resume_run',   type=str,   default='')
 parser.add_argument('--val_dir',      type=str,   default='../../data/test/Set11')
 parser.add_argument('--val_every',    type=int,   default=10)
 args = parser.parse_args()
+
+run_id   = args.run_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+run_dir  = os.path.join(args.result_dir, run_id)
+ckpt_dir = os.path.join(run_dir, 'checkpoints')
+log_dir  = os.path.join(run_dir, 'logs')
+print(f'Run ID: {run_id}  ->  {run_dir}')
 
 os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -84,20 +92,16 @@ loader = DataLoader(PatchDataset(labels), batch_size=args.batch_size,
 model = MGSPINet(num_layers=args.num_layers, channels=args.channels)
 model = nn.DataParallel(model).to(device)
 
-os.makedirs(args.ckpt_dir, exist_ok=True)
-os.makedirs(args.log_dir,  exist_ok=True)
+os.makedirs(ckpt_dir, exist_ok=True)
+os.makedirs(log_dir,  exist_ok=True)
 
-ckpt_prefix = os.path.join(
-    args.ckpt_dir,
-    f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}'
-)
-log_path = os.path.join(
-    args.log_dir,
-    f'train_layer{args.num_layers}_ratio{args.cs_ratio}.txt'
-)
+ckpt_prefix = os.path.join(ckpt_dir, f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}')
+log_path    = os.path.join(log_dir,  f'train_layer{args.num_layers}_ratio{args.cs_ratio}.txt')
 
 if args.resume_epoch > 0:
-    ckpt = f'{ckpt_prefix}_epoch{args.resume_epoch}.pth'
+    resume_run = args.resume_run or run_id
+    resume_ckpt_dir = os.path.join(args.result_dir, resume_run, 'checkpoints')
+    ckpt = os.path.join(resume_ckpt_dir, f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}_epoch{args.resume_epoch}.pth')
     model.load_state_dict(torch.load(ckpt, map_location=device))
     print(f'Resumed from {ckpt}')
 
