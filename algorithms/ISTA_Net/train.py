@@ -1,13 +1,16 @@
 import os
+import glob
 import platform
 import argparse
 import numpy as np
 import scipy.io as sio
+import cv2
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 from model import ISTANetPlus
+from utils import imread_cs, img2col, col2im, compute_psnr
 
 # ---------------------------------------------------------------------------
 # Args
@@ -24,6 +27,8 @@ parser.add_argument('--matrix_dir',     type=str,   default='../../matrices')
 parser.add_argument('--ckpt_dir',       type=str,   default='../../results/ISTA_Net/checkpoints')
 parser.add_argument('--log_dir',        type=str,   default='../../results/ISTA_Net/logs')
 parser.add_argument('--resume_epoch',   type=int,   default=0,     help='resume from this epoch (0 = scratch)')
+parser.add_argument('--val_dir',        type=str,   default='../../data/test/Set11', help='validation image folder')
+parser.add_argument('--val_every',      type=int,   default=10,    help='validate every N epochs')
 args = parser.parse_args()
 
 os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
@@ -121,6 +126,37 @@ if args.resume_epoch > 0:
 
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 gamma     = torch.tensor(0.01, device=device)
+best_psnr = 0.0
+best_path = f'{ckpt_prefix}_best.pth'
+
+# ---------------------------------------------------------------------------
+# Validation helper
+# ---------------------------------------------------------------------------
+def validate():
+    img_paths = sorted(
+        glob.glob(os.path.join(args.val_dir, '*.tif')) +
+        glob.glob(os.path.join(args.val_dir, '*.png')) +
+        glob.glob(os.path.join(args.val_dir, '*.bmp'))
+    )
+    if not img_paths:
+        return None
+    psnr_list = []
+    model.eval()
+    with torch.no_grad():
+        for path in img_paths:
+            img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
+            img_yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
+            Iorg_y  = img_yuv[:, :, 0]
+            Iorg, row, col, Ipad, row_new, col_new = imread_cs(Iorg_y)
+            Icol  = img2col(Ipad) / 255.0
+            batch = torch.from_numpy(Icol.astype(np.float32)).to(device)
+            Phix  = torch.mm(batch, Phi.T)
+            x_out, _ = model(Phix, Phi, Qinit)
+            pred  = x_out.cpu().numpy()
+            X_rec = np.clip(col2im(pred, row, col, row_new, col_new), 0, 1)
+            psnr_list.append(compute_psnr(X_rec * 255, Iorg.astype(np.float64)))
+    model.train()
+    return float(np.mean(psnr_list))
 
 # ---------------------------------------------------------------------------
 # Training loop
@@ -135,9 +171,9 @@ for epoch in range(args.resume_epoch + 1, args.epochs + 1):
 
         x_out, sym_losses = model(Phix, Phi, Qinit)
 
-        loss_recon      = torch.mean((x_out - batch) ** 2)
-        loss_sym        = sum(torch.mean(s ** 2) for s in sym_losses)
-        loss            = loss_recon + gamma * loss_sym
+        loss_recon = torch.mean((x_out - batch) ** 2)
+        loss_sym   = sum(torch.mean(s ** 2) for s in sym_losses)
+        loss       = loss_recon + gamma * loss_sym
 
         optimizer.zero_grad()
         loss.backward()
@@ -145,7 +181,18 @@ for epoch in range(args.resume_epoch + 1, args.epochs + 1):
 
     log_line = (f'[{epoch:03d}/{args.epochs}] '
                 f'total={loss.item():.4f}  recon={loss_recon.item():.4f}  '
-                f'sym={loss_sym.item():.4f}\n')
+                f'sym={loss_sym.item():.4f}')
+
+    if epoch % args.val_every == 0:
+        val_psnr = validate()
+        if val_psnr is not None:
+            log_line += f'  val_psnr={val_psnr:.2f}'
+            if val_psnr > best_psnr:
+                best_psnr = val_psnr
+                torch.save(model.state_dict(), best_path)
+                log_line += '  [best]'
+
+    log_line += '\n'
     print(log_line, end='')
     with open(log_path, 'a') as f:
         f.write(log_line)
@@ -153,4 +200,4 @@ for epoch in range(args.resume_epoch + 1, args.epochs + 1):
     if epoch % 5 == 0:
         torch.save(model.state_dict(), f'{ckpt_prefix}_epoch{epoch}.pth')
 
-print('Training finished.')
+print(f'Training finished. Best val PSNR: {best_psnr:.2f} dB  ->  {best_path}')

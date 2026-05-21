@@ -16,6 +16,7 @@ parser.add_argument('--cs_ratio',   type=int,   default=25, choices=[1, 4, 10, 2
 parser.add_argument('--num_layers', type=int,   default=9)
 parser.add_argument('--channels',   type=int,   default=32)
 parser.add_argument('--epoch_num',  type=int,   default=200)
+parser.add_argument('--use_best',   action='store_true', help='load best_model.pth')
 parser.add_argument('--gpu',        type=str,   default='0')
 parser.add_argument('--test_set',   type=str,   default='Set11')
 parser.add_argument('--data_dir',   type=str,   default='../../data/test')
@@ -49,10 +50,11 @@ Qinit = torch.from_numpy(Qinit_np).to(device)
 # ---------------------------------------------------------------------------
 # Load model
 # ---------------------------------------------------------------------------
-ckpt_path = os.path.join(
-    args.ckpt_dir,
-    f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}_epoch{args.epoch_num}.pth'
-)
+ckpt_prefix = f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}'
+if args.use_best:
+    ckpt_path = os.path.join(args.ckpt_dir, f'{ckpt_prefix}_best.pth')
+else:
+    ckpt_path = os.path.join(args.ckpt_dir, f'{ckpt_prefix}_epoch{args.epoch_num}.pth')
 model = MGSPINet(num_layers=args.num_layers, channels=args.channels)
 model = nn.DataParallel(model).to(device)
 model.load_state_dict(torch.load(ckpt_path, map_location=device))
