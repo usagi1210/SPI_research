@@ -31,8 +31,8 @@ def main():
                         default=os.path.join(_here, '../data/train/BSD400'),
                         help='BSD400 图片目录')
     parser.add_argument('--out_dir',    type=str,
-                        default=os.path.join(_here, '../data/train'),
-                        help='输出目录，生成 Training_Data.mat')
+                        default=os.path.join(_here, '../data/train/BSD400'),
+                        help='输出目录，生成 Training_Data.mat（默认与图片同目录）')
     parser.add_argument('--patch_size', type=int, default=PATCH_SIZE)
     parser.add_argument('--stride',     type=int, default=14,
                         help='patch 提取步长，越小 patch 越多（默认 14，约 20 万 patch）')
