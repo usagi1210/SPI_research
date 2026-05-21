@@ -1,11 +1,9 @@
 """
 从 BSD400 提取 33x33 patch，保存为 Training_Data.mat。
 
-用法（在 utils/ 目录下运行）：
+可以从任意目录运行：
+    python utils/prepare_training_data.py
     python prepare_training_data.py
-
-或指定路径：
-    python prepare_training_data.py --img_dir ../data/train/BSD400 --stride 14
 """
 import os
 import argparse
@@ -28,9 +26,12 @@ def extract_patches(img: np.ndarray, patch_size: int, stride: int) -> list:
 
 def main():
     parser = argparse.ArgumentParser(description='Prepare BSD400 training patches')
-    parser.add_argument('--img_dir',    type=str, default='../data/train/BSD400',
+    _here = os.path.dirname(os.path.abspath(__file__))
+    parser.add_argument('--img_dir',    type=str,
+                        default=os.path.join(_here, '../data/train/BSD400'),
                         help='BSD400 图片目录')
-    parser.add_argument('--out_dir',    type=str, default='../data/train',
+    parser.add_argument('--out_dir',    type=str,
+                        default=os.path.join(_here, '../data/train'),
                         help='输出目录，生成 Training_Data.mat')
     parser.add_argument('--patch_size', type=int, default=PATCH_SIZE)
     parser.add_argument('--stride',     type=int, default=14,
