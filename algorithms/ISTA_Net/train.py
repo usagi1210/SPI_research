@@ -2,13 +2,18 @@ import os
 import glob
 import platform
 import argparse
+import logging
+import time
 from datetime import datetime
 import numpy as np
 import scipy.io as sio
 import cv2
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from model import ISTANetPlus
 from utils import imread_cs, img2col, col2im, compute_psnr
@@ -17,127 +22,147 @@ from utils import imread_cs, img2col, col2im, compute_psnr
 # Args
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description='Train ISTA-Net+')
-parser.add_argument('--cs_ratio',       type=int,   default=25,    choices=[1, 4, 10, 25, 30, 40, 50])
-parser.add_argument('--num_layers',     type=int,   default=9,     help='number of unrolled phases')
-parser.add_argument('--lr',             type=float, default=1e-4)
-parser.add_argument('--epochs',         type=int,   default=200)
-parser.add_argument('--batch_size',     type=int,   default=64)
-parser.add_argument('--gpu',            type=str,   default='0')
-parser.add_argument('--data_dir',       type=str,   default='../../data/train/BSD400')
-parser.add_argument('--matrix_dir',     type=str,   default='../../matrices')
-parser.add_argument('--result_dir',     type=str,   default='../../results/ISTA_Net')
-parser.add_argument('--run_id',         type=str,   default='',    help='run identifier (default: auto timestamp)')
-parser.add_argument('--resume_epoch',   type=int,   default=0,     help='resume from this epoch (0 = scratch)')
-parser.add_argument('--resume_run',     type=str,   default='',    help='run_id to resume from')
-parser.add_argument('--val_dir',        type=str,   default='../../data/test/Set11')
-parser.add_argument('--val_every',      type=int,   default=10)
+parser.add_argument('--cs_ratio',     type=int,   default=25, choices=[1, 4, 10, 25, 30, 40, 50])
+parser.add_argument('--num_layers',   type=int,   default=9)
+parser.add_argument('--lr',           type=float, default=1e-4)
+parser.add_argument('--epochs',       type=int,   default=200)
+parser.add_argument('--batch_size',   type=int,   default=64)
+parser.add_argument('--gpu',          type=str,   default='0',  help='GPU id (single-GPU mode)')
+parser.add_argument('--distributed',  action='store_true',      help='enable DDP multi-GPU (launch with torchrun)')
+parser.add_argument('--num_workers',  type=int,   default=4)
+parser.add_argument('--data_dir',     type=str,   default='../../data/train/BSD400')
+parser.add_argument('--matrix_dir',   type=str,   default='../../matrices')
+parser.add_argument('--result_dir',   type=str,   default='../../results/ISTA_Net')
+parser.add_argument('--run_id',       type=str,   default='')
+parser.add_argument('--resume_epoch', type=int,   default=0)
+parser.add_argument('--resume_run',   type=str,   default='')
+parser.add_argument('--val_dir',      type=str,   default='../../data/test/Set11')
+parser.add_argument('--val_every',    type=int,   default=10)
+parser.add_argument('--iter_step',    type=int,   default=100,  help='print loss every N iterations')
 args = parser.parse_args()
 
+torch.set_float32_matmul_precision('highest')
+
 # ---------------------------------------------------------------------------
-# Run directory  (results/ISTA_Net/{run_id}/)
+# Distributed setup
+# ---------------------------------------------------------------------------
+if args.distributed:
+    dist.init_process_group(backend='nccl')
+    local_rank = int(os.environ['LOCAL_RANK'])
+    device = torch.device('cuda', local_rank)
+    rank = dist.get_rank()
+else:
+    os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    rank = 0
+
+is_main = (rank == 0)
+
+# ---------------------------------------------------------------------------
+# Run directory
 # ---------------------------------------------------------------------------
 run_id   = args.run_id or datetime.now().strftime('%Y%m%d_%H%M%S')
 run_dir  = os.path.join(args.result_dir, run_id)
 ckpt_dir = os.path.join(run_dir, 'checkpoints')
 log_dir  = os.path.join(run_dir, 'logs')
-print(f'Run ID: {run_id}  ->  {run_dir}')
 
-os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-try:
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32       = False
-except Exception:
-    pass
+if is_main:
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(log_dir,  exist_ok=True)
 
 # ---------------------------------------------------------------------------
-# Ratio → measurement dimension mapping
+# Logger
+# ---------------------------------------------------------------------------
+def build_logger(log_path):
+    logger = logging.getLogger('train')
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter('%(asctime)s  %(message)s', datefmt='%H:%M:%S')
+    fh = logging.FileHandler(log_path)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger
+
+logger = None
+if is_main:
+    log_path = os.path.join(log_dir, f'train_layer{args.num_layers}_ratio{args.cs_ratio}.txt')
+    logger = build_logger(log_path)
+    logger.info(f'Run ID : {run_id}')
+    logger.info(f'Run dir: {run_dir}')
+    logger.info(f'layers={args.num_layers}  ratio={args.cs_ratio}%  lr={args.lr}  '
+                f'epochs={args.epochs}  batch={args.batch_size}  '
+                f'distributed={args.distributed}')
+
+# ---------------------------------------------------------------------------
+# Data
 # ---------------------------------------------------------------------------
 RATIO_TO_M = {1: 10, 4: 43, 10: 109, 25: 272, 30: 327, 40: 436, 50: 545}
-n_input  = RATIO_TO_M[args.cs_ratio]
-n_output = 1089   # 33 × 33
 
-# ---------------------------------------------------------------------------
-# Load sampling matrix and training data
-# ---------------------------------------------------------------------------
 phi_path = os.path.join(args.matrix_dir, f'phi_0_{args.cs_ratio}_1089.mat')
-Phi_np   = sio.loadmat(phi_path)['phi'].astype(np.float32)          # (M, 1089)
+Phi_np   = sio.loadmat(phi_path)['phi'].astype(np.float32)
 
-train_path    = os.path.join(args.data_dir, 'Training_Data.mat')
-training_data = sio.loadmat(train_path)
-labels        = training_data['labels'].astype(np.float32)           # (N, 1089)
-nrtrain       = labels.shape[0]
+labels = sio.loadmat(os.path.join(args.data_dir, 'Training_Data.mat'))['labels'].astype(np.float32)
 
-# ---------------------------------------------------------------------------
-# Qinit: least-squares initialisation matrix
-# ---------------------------------------------------------------------------
 qinit_path = os.path.join(args.matrix_dir, f'Initialization_Matrix_{args.cs_ratio}.mat')
 if os.path.exists(qinit_path):
     Qinit_np = sio.loadmat(qinit_path)['Qinit'].astype(np.float32)
 else:
-    X   = labels.T                            # (1089, N)
-    Y   = Phi_np @ X                          # (M, N)
-    YYT = Y @ Y.T
-    XYT = X @ Y.T
-    Qinit_np = (XYT @ np.linalg.inv(YYT)).astype(np.float32)
-    os.makedirs(args.matrix_dir, exist_ok=True)
-    sio.savemat(qinit_path, {'Qinit': Qinit_np})
-    print(f'Saved Qinit to {qinit_path}')
+    X        = labels.T
+    Y        = Phi_np @ X
+    Qinit_np = (X @ Y.T @ np.linalg.inv(Y @ Y.T)).astype(np.float32)
+    if is_main:
+        sio.savemat(qinit_path, {'Qinit': Qinit_np})
+        logger.info(f'Saved Qinit -> {qinit_path}')
 
 Phi   = torch.from_numpy(Phi_np).to(device)
 Qinit = torch.from_numpy(Qinit_np).to(device)
 
-# ---------------------------------------------------------------------------
-# Dataset / DataLoader
-# ---------------------------------------------------------------------------
 class PatchDataset(Dataset):
     def __init__(self, data):
         self.data = torch.from_numpy(data)
-
     def __len__(self):
         return len(self.data)
-
     def __getitem__(self, idx):
         return self.data[idx]
 
-
-num_workers = 0 if platform.system() == 'Windows' else 4
-loader = DataLoader(
-    PatchDataset(labels),
-    batch_size=args.batch_size,
-    shuffle=True,
-    num_workers=num_workers,
-    pin_memory=True,
-)
+dataset = PatchDataset(labels)
+num_workers = 0 if platform.system() == 'Windows' else args.num_workers
+if args.distributed:
+    sampler = DistributedSampler(dataset, shuffle=True)
+    loader  = DataLoader(dataset, batch_size=args.batch_size,
+                         sampler=sampler, num_workers=num_workers, pin_memory=True)
+else:
+    loader = DataLoader(dataset, batch_size=args.batch_size,
+                        shuffle=True, num_workers=num_workers, pin_memory=True)
 
 # ---------------------------------------------------------------------------
 # Model
 # ---------------------------------------------------------------------------
-model = ISTANetPlus(args.num_layers)
-model = nn.DataParallel(model).to(device)
-
-os.makedirs(ckpt_dir, exist_ok=True)
-os.makedirs(log_dir,  exist_ok=True)
+model = ISTANetPlus(args.num_layers).to(device)
 
 ckpt_prefix = os.path.join(ckpt_dir, f'ista_net_plus_layer{args.num_layers}_ratio{args.cs_ratio}')
-log_path    = os.path.join(log_dir,  f'train_layer{args.num_layers}_ratio{args.cs_ratio}.txt')
+best_path   = f'{ckpt_prefix}_best.pth'
 
 if args.resume_epoch > 0:
     resume_run = args.resume_run or run_id
-    resume_dir = os.path.join(args.result_dir, resume_run, 'checkpoints')
-    ckpt = os.path.join(resume_dir, f'ista_net_plus_layer{args.num_layers}_ratio{args.cs_ratio}_epoch{args.resume_epoch}.pth')
-    model.load_state_dict(torch.load(ckpt, map_location=device))
-    print(f'Resumed from {ckpt}')
+    src = os.path.join(args.result_dir, resume_run, 'checkpoints',
+                       f'ista_net_plus_layer{args.num_layers}_ratio{args.cs_ratio}_epoch{args.resume_epoch}.pth')
+    model.load_state_dict(torch.load(src, map_location=device))
+    if is_main:
+        logger.info(f'Resumed from {src}')
+
+if args.distributed:
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 gamma     = torch.tensor(0.01, device=device)
 best_psnr = 0.0
-best_path = f'{ckpt_prefix}_best.pth'
 
 # ---------------------------------------------------------------------------
-# Validation helper
+# Validation
 # ---------------------------------------------------------------------------
 def validate():
     img_paths = sorted(
@@ -147,8 +172,9 @@ def validate():
     )
     if not img_paths:
         return None
+    net = model.module if args.distributed else model
+    net.eval()
     psnr_list = []
-    model.eval()
     with torch.no_grad():
         for path in img_paths:
             img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -158,21 +184,28 @@ def validate():
             Icol  = img2col(Ipad) / 255.0
             batch = torch.from_numpy(Icol.astype(np.float32)).to(device)
             Phix  = torch.mm(batch, Phi.T)
-            x_out, _ = model(Phix, Phi, Qinit)
+            x_out, _ = net(Phix, Phi, Qinit)
             pred  = x_out.cpu().numpy()
             X_rec = np.clip(col2im(pred, row, col, row_new, col_new), 0, 1)
             psnr_list.append(compute_psnr(X_rec * 255, Iorg.astype(np.float64)))
-    model.train()
+    net.train()
     return float(np.mean(psnr_list))
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
-print(f'Training: layers={args.num_layers}, ratio={args.cs_ratio}%, device={device}')
+if is_main:
+    logger.info('Training started.')
 
 for epoch in range(args.resume_epoch + 1, args.epochs + 1):
+    if args.distributed:
+        sampler.set_epoch(epoch)
+
     model.train()
-    for batch in loader:
+    epoch_loss = 0.0
+    t0 = time.time()
+
+    for iteration, batch in enumerate(loader):
         batch = batch.to(device)
         Phix  = torch.mm(batch, Phi.T)
 
@@ -186,25 +219,40 @@ for epoch in range(args.resume_epoch + 1, args.epochs + 1):
         loss.backward()
         optimizer.step()
 
-    log_line = (f'[{epoch:03d}/{args.epochs}] '
-                f'total={loss.item():.4f}  recon={loss_recon.item():.4f}  '
-                f'sym={loss_sym.item():.4f}')
+        epoch_loss += loss.item()
 
-    if epoch % args.val_every == 0:
-        val_psnr = validate()
-        if val_psnr is not None:
-            log_line += f'  val_psnr={val_psnr:.2f}'
-            if val_psnr > best_psnr:
-                best_psnr = val_psnr
-                torch.save(model.state_dict(), best_path)
-                log_line += '  [best]'
+        if is_main and iteration % args.iter_step == 0:
+            lr = optimizer.param_groups[0]['lr']
+            logger.info(
+                f'epoch {epoch:<3d}  iter {iteration:<4d}  '
+                f'loss {loss.item():.5f}  recon {loss_recon.item():.5f}  '
+                f'sym {loss_sym.item():.5f}  lr {lr:.6f}'
+            )
 
-    log_line += '\n'
-    print(log_line, end='')
-    with open(log_path, 'a') as f:
-        f.write(log_line)
+    if is_main:
+        elapsed = time.time() - t0
+        avg_loss = epoch_loss / (iteration + 1)
+        lr = optimizer.param_groups[0]['lr']
+        msg = (f'epoch {epoch:<3d}  avg_loss {avg_loss:.5f}  '
+               f'lr {lr:.6f}  time {elapsed:.1f}s')
 
-    if epoch % 5 == 0:
-        torch.save(model.state_dict(), f'{ckpt_prefix}_epoch{epoch}.pth')
+        if epoch % args.val_every == 0:
+            val_psnr = validate()
+            if val_psnr is not None:
+                msg += f'  val_psnr {val_psnr:.2f} dB'
+                if val_psnr > best_psnr:
+                    best_psnr = val_psnr
+                    net_to_save = model.module if args.distributed else model
+                    torch.save(net_to_save.state_dict(), best_path)
+                    msg += '  [best]'
+        logger.info(msg + '\n')
 
-print(f'Training finished. Best val PSNR: {best_psnr:.2f} dB  ->  {best_path}')
+        if epoch % 5 == 0:
+            net_to_save = model.module if args.distributed else model
+            torch.save(net_to_save.state_dict(), f'{ckpt_prefix}_epoch{epoch}.pth')
+
+if is_main:
+    logger.info(f'Training finished. Best val PSNR: {best_psnr:.2f} dB')
+
+if args.distributed:
+    dist.destroy_process_group()
