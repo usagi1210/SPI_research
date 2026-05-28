@@ -34,9 +34,3 @@ SPI_research/
 |-----------|-----------|-------------|
 | ISTA-Net+ | CVPR 2018 | In progress |
 | LoRA-DUN  | Ours      | In progress |
-
-## Workflow
-
-1. Edit code locally
-2. Push to GitHub
-3. `git pull` on the server and run experiments
