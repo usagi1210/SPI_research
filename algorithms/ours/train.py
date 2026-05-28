@@ -1,10 +1,18 @@
+"""Training entry point for LoRA-DUN variants.
+
+Usage:
+    python train.py --config configs/base_dun.yaml --cr 0.10
+    torchrun --nproc_per_node=2 train.py --config configs/base_dun.yaml --cr 0.10 --distributed
+"""
 import os
+import sys
 import glob
 import platform
 import argparse
 import logging
 import time
-from datetime import datetime
+import yaml
+import math
 import numpy as np
 import scipy.io as sio
 import cv2
@@ -12,70 +20,32 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from datetime import datetime
 
-from model import MGSPINet
-from utils import imread_cs, img2col, col2im, compute_psnr
-
-# ---------------------------------------------------------------------------
-# Args
-# ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description='Train MG-SPINet')
-parser.add_argument('--cs_ratio',     type=int,   default=25, choices=[1, 4, 10, 25, 30, 40, 50])
-parser.add_argument('--num_layers',   type=int,   default=9)
-parser.add_argument('--channels',     type=int,   default=32)
-parser.add_argument('--lr',           type=float, default=1e-4)
-parser.add_argument('--epochs',       type=int,   default=200)
-parser.add_argument('--batch_size',   type=int,   default=64)
-parser.add_argument('--gpu',          type=str,   default='0')
-parser.add_argument('--distributed',  action='store_true')
-parser.add_argument('--num_workers',  type=int,   default=4)
-parser.add_argument('--data_dir',     type=str,   default='../../data/train/BSD400')
-parser.add_argument('--matrix_dir',   type=str,   default='../../matrices')
-parser.add_argument('--result_dir',   type=str,   default='../../results/ours')
-parser.add_argument('--run_id',       type=str,   default='')
-parser.add_argument('--resume_epoch', type=int,   default=0)
-parser.add_argument('--resume_run',   type=str,   default='')
-parser.add_argument('--val_dir',      type=str,   default='../../data/test/Set11')
-parser.add_argument('--val_every',    type=int,   default=10)
-parser.add_argument('--iter_step',    type=int,   default=100)
-args = parser.parse_args()
+sys.path.insert(0, os.path.dirname(__file__))
+from lora_dun import build_model
+from dataset import BSD400Dataset, load_test_image, img_to_blocks, blocks_to_img
+from loss import build_loss
 
 torch.set_float32_matmul_precision('highest')
 
-# ---------------------------------------------------------------------------
-# Distributed setup
-# ---------------------------------------------------------------------------
-if args.distributed:
-    dist.init_process_group(backend='nccl')
-    local_rank = int(os.environ['LOCAL_RANK'])
-    device = torch.device('cuda', local_rank)
-    rank = dist.get_rank()
-else:
-    os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-    rank = 0
-
-is_main = (rank == 0)
 
 # ---------------------------------------------------------------------------
-# Run directory
+# Config
 # ---------------------------------------------------------------------------
-run_id   = args.run_id or datetime.now().strftime('%Y%m%d_%H%M%S')
-run_dir  = os.path.join(args.result_dir, run_id)
-ckpt_dir = os.path.join(run_dir, 'checkpoints')
-log_dir  = os.path.join(run_dir, 'logs')
 
-if is_main:
-    os.makedirs(ckpt_dir, exist_ok=True)
-    os.makedirs(log_dir,  exist_ok=True)
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        return yaml.safe_load(f)
+
 
 # ---------------------------------------------------------------------------
 # Logger
 # ---------------------------------------------------------------------------
-def build_logger(log_path):
+
+def build_logger(log_path: str) -> logging.Logger:
     logger = logging.getLogger('train')
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter('%(asctime)s  %(message)s', datefmt='%H:%M:%S')
@@ -87,171 +57,264 @@ def build_logger(log_path):
     logger.addHandler(ch)
     return logger
 
-logger = None
-if is_main:
-    log_path = os.path.join(log_dir, f'train_layer{args.num_layers}_ratio{args.cs_ratio}.txt')
-    logger = build_logger(log_path)
-    logger.info(f'Run ID : {run_id}')
-    logger.info(f'Run dir: {run_dir}')
-    logger.info(f'layers={args.num_layers}  ch={args.channels}  ratio={args.cs_ratio}%  '
-                f'lr={args.lr}  epochs={args.epochs}  batch={args.batch_size}  '
-                f'distributed={args.distributed}')
 
 # ---------------------------------------------------------------------------
-# Data
+# Metrics
 # ---------------------------------------------------------------------------
-phi_path = os.path.join(args.matrix_dir, f'phi_0_{args.cs_ratio}_1089.mat')
-Phi_np   = sio.loadmat(phi_path)['phi'].astype(np.float32)
 
-labels = sio.loadmat(os.path.join(args.data_dir, 'Training_Data.mat'))['labels'].astype(np.float32)
+def compute_psnr(img1: np.ndarray, img2: np.ndarray) -> float:
+    """img1, img2 in [0, 1]."""
+    mse = np.mean((img1 - img2) ** 2)
+    return 100.0 if mse == 0 else 20 * math.log10(1.0 / math.sqrt(mse))
 
-qinit_path = os.path.join(args.matrix_dir, f'Initialization_Matrix_{args.cs_ratio}.mat')
-if os.path.exists(qinit_path):
-    Qinit_np = sio.loadmat(qinit_path)['Qinit'].astype(np.float32)
-else:
-    X        = labels.T
-    Y        = Phi_np @ X
-    Qinit_np = (X @ Y.T @ np.linalg.inv(Y @ Y.T)).astype(np.float32)
-    if is_main:
-        sio.savemat(qinit_path, {'Qinit': Qinit_np})
-        logger.info(f'Saved Qinit -> {qinit_path}')
-
-Phi   = torch.from_numpy(Phi_np).to(device)
-Qinit = torch.from_numpy(Qinit_np).to(device)
-
-class PatchDataset(Dataset):
-    def __init__(self, data):
-        self.data = torch.from_numpy(data)
-    def __len__(self):
-        return len(self.data)
-    def __getitem__(self, idx):
-        return self.data[idx]
-
-dataset = PatchDataset(labels)
-num_workers = 0 if platform.system() == 'Windows' else args.num_workers
-if args.distributed:
-    sampler = DistributedSampler(dataset, shuffle=True)
-    loader  = DataLoader(dataset, batch_size=args.batch_size,
-                         sampler=sampler, num_workers=num_workers, pin_memory=True)
-else:
-    loader = DataLoader(dataset, batch_size=args.batch_size,
-                        shuffle=True, num_workers=num_workers, pin_memory=True)
-
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
-model = MGSPINet(num_layers=args.num_layers, channels=args.channels).to(device)
-
-ckpt_prefix = os.path.join(ckpt_dir, f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}')
-best_path   = f'{ckpt_prefix}_best.pth'
-
-if args.resume_epoch > 0:
-    resume_run = args.resume_run or run_id
-    src = os.path.join(args.result_dir, resume_run, 'checkpoints',
-                       f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}_epoch{args.resume_epoch}.pth')
-    model.load_state_dict(torch.load(src, map_location=device))
-    if is_main:
-        logger.info(f'Resumed from {src}')
-
-if args.distributed:
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-gamma     = torch.tensor(0.01, device=device)
-best_psnr = 0.0
 
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
-def validate():
+
+def validate(model, Phi, val_dir: str, patch_size: int,
+             device, batch_size: int = 64) -> float:
     img_paths = sorted(
-        glob.glob(os.path.join(args.val_dir, '*.tif')) +
-        glob.glob(os.path.join(args.val_dir, '*.png')) +
-        glob.glob(os.path.join(args.val_dir, '*.bmp'))
+        glob.glob(os.path.join(val_dir, '*.tif')) +
+        glob.glob(os.path.join(val_dir, '*.png')) +
+        glob.glob(os.path.join(val_dir, '*.bmp'))
     )
     if not img_paths:
         return None
-    net = model.module if args.distributed else model
-    net.eval()
+
+    model.eval()
     psnr_list = []
     with torch.no_grad():
         for path in img_paths:
-            img_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
-            img_yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
-            Iorg_y  = img_yuv[:, :, 0]
-            Iorg, row, col, Ipad, row_new, col_new = imread_cs(Iorg_y)
-            Icol  = img2col(Ipad) / 255.0
-            batch = torch.from_numpy(Icol.astype(np.float32)).to(device)
-            Phix  = torch.mm(batch, Phi.T)
-            x_out, _ = net(Phix, Phi, Qinit)
-            pred  = x_out.cpu().numpy()
-            X_rec = np.clip(col2im(pred, row, col, row_new, col_new), 0, 1)
-            psnr_list.append(compute_psnr(X_rec * 255, Iorg.astype(np.float64)))
-    net.train()
-    return float(np.mean(psnr_list))
+            img = load_test_image(path)
+            blocks, ph, pw, h0, w0 = img_to_blocks(img, patch_size)  # (K, N)
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-if is_main:
-    logger.info('Training started.')
+            rec_blocks = []
+            for i in range(0, len(blocks), batch_size):
+                chunk = torch.from_numpy(blocks[i:i+batch_size]).to(device)  # (bs, N)
+                y = chunk @ Phi.T                                             # (bs, M)
+                out = model(y, Phi)                                           # (bs, 1, p, p)
+                rec_blocks.append(out.squeeze(1).view(-1, patch_size * patch_size).cpu().numpy())
 
-for epoch in range(args.resume_epoch + 1, args.epochs + 1):
-    if args.distributed:
-        sampler.set_epoch(epoch)
+            rec_blocks = np.concatenate(rec_blocks, axis=0)
+            rec_img = blocks_to_img(rec_blocks, ph, pw, h0, w0, patch_size)
+            psnr_list.append(compute_psnr(rec_img, img))
 
     model.train()
-    epoch_loss = 0.0
-    t0 = time.time()
+    return float(np.mean(psnr_list))
 
-    for iteration, batch in enumerate(loader):
-        batch = batch.to(device)
-        Phix  = torch.mm(batch, Phi.T)
 
-        x_out, sym_losses = model(Phix, Phi, Qinit)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-        loss_recon = torch.mean((x_out - batch) ** 2)
-        loss_sym   = sum(torch.mean(s ** 2) for s in sym_losses)
-        loss       = loss_recon + gamma * loss_sym
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config',      type=str, required=True)
+    parser.add_argument('--cr',          type=float, default=None,
+                        help='Compression ratio override (e.g. 0.10)')
+    parser.add_argument('--gpu',         type=str,  default='0')
+    parser.add_argument('--distributed', action='store_true')
+    parser.add_argument('--resume',      type=str,  default=None,
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--run_id',      type=str,  default=None)
+    args = parser.parse_args()
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    cfg = load_config(args.config)
+    if args.cr is not None:
+        cfg['cr'] = args.cr
 
-        epoch_loss += loss.item()
+    cr    = cfg['cr']
+    cr_pct = int(round(cr * 100))   # e.g. 10
 
-        if is_main and iteration % args.iter_step == 0:
-            lr = optimizer.param_groups[0]['lr']
-            logger.info(
-                f'epoch {epoch:<3d}  iter {iteration:<4d}  '
-                f'loss {loss.item():.5f}  recon {loss_recon.item():.5f}  '
-                f'sym {loss_sym.item():.5f}  lr {lr:.6f}'
-            )
+    # ---- Distributed setup ------------------------------------------------
+    if args.distributed:
+        dist.init_process_group(backend='nccl')
+        local_rank = int(os.environ['LOCAL_RANK'])
+        device = torch.device('cuda', local_rank)
+        rank   = dist.get_rank()
+    else:
+        os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        rank   = 0
+
+    is_main = (rank == 0)
+
+    # ---- Run directory ----------------------------------------------------
+    run_id   = args.run_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+    base_dir = os.path.join(cfg['result_dir'], f'cr{cr_pct}', run_id)
+    ckpt_dir = os.path.join(base_dir, 'checkpoints')
+    log_dir  = os.path.join(base_dir, 'logs')
+    if is_main:
+        os.makedirs(ckpt_dir, exist_ok=True)
+        os.makedirs(log_dir,  exist_ok=True)
+
+    # ---- Logger -----------------------------------------------------------
+    logger = None
+    if is_main:
+        log_path = os.path.join(log_dir, f'train_cr{cr_pct}.log')
+        logger   = build_logger(log_path)
+        logger.info(f'Run ID : {run_id}')
+        logger.info(f'Config : {args.config}')
+        logger.info(f'Model  : {cfg["model_name"]}  stages={cfg["num_stages"]}  '
+                    f'channels={cfg["channels"]}')
+        logger.info(f'CR     : {cr_pct}%  epochs={cfg["epochs"]}  '
+                    f'batch={cfg["batch_size"]}  lr={cfg["lr"]}')
+        logger.info(f'Device : {device}  distributed={args.distributed}')
+
+    # ---- Measurement matrix -----------------------------------------------
+    N = cfg['patch_size'] ** 2   # 64*64 = 4096
+    mat_file = os.path.join(cfg['matrix_dir'], f'phi_{cr}_{N}.mat')
+    if not os.path.exists(mat_file):
+        raise FileNotFoundError(
+            f'Matrix not found: {mat_file}\n'
+            f'Run: python ../../utils/gen_matrices.py'
+        )
+    Phi_np = sio.loadmat(mat_file)['phi'].astype(np.float32)   # (M, N)
+    Phi    = torch.from_numpy(Phi_np).to(device)
 
     if is_main:
-        elapsed = time.time() - t0
-        avg_loss = epoch_loss / (iteration + 1)
-        lr = optimizer.param_groups[0]['lr']
-        msg = (f'epoch {epoch:<3d}  avg_loss {avg_loss:.5f}  '
-               f'lr {lr:.6f}  time {elapsed:.1f}s')
+        logger.info(f'Matrix : {mat_file}  shape={Phi_np.shape}')
 
-        if epoch % args.val_every == 0:
-            val_psnr = validate()
-            if val_psnr is not None:
-                msg += f'  val_psnr {val_psnr:.2f} dB'
-                if val_psnr > best_psnr:
-                    best_psnr = val_psnr
+    # ---- Dataset ----------------------------------------------------------
+    num_workers = 0 if platform.system() == 'Windows' else cfg.get('num_workers', 4)
+    dataset = BSD400Dataset(
+        cfg['train_dir'],
+        patch_size=cfg['patch_size'],
+        patches_per_image=cfg.get('patches_per_image', 50),
+    )
+    if args.distributed:
+        sampler = DistributedSampler(dataset, shuffle=True)
+        loader  = DataLoader(dataset, batch_size=cfg['batch_size'],
+                             sampler=sampler, num_workers=num_workers, pin_memory=True)
+    else:
+        loader = DataLoader(dataset, batch_size=cfg['batch_size'],
+                            shuffle=True, num_workers=num_workers, pin_memory=True)
+
+    if is_main:
+        logger.info(f'Train  : {len(dataset)} patches, {len(loader)} iters/epoch')
+
+    # ---- Model ------------------------------------------------------------
+    model = build_model(cfg).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    if is_main:
+        logger.info(f'Params : {total_params:.2f} M')
+
+    start_epoch = 0
+    best_psnr   = 0.0
+    best_path   = os.path.join(ckpt_dir, f'best_cr{cr_pct}.pth')
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model'])
+        start_epoch = ckpt.get('epoch', 0)
+        best_psnr   = ckpt.get('best_psnr', 0.0)
+        if is_main:
+            logger.info(f'Resumed from {args.resume} (epoch {start_epoch})')
+
+    if args.distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    # ---- Optimiser + scheduler -------------------------------------------
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cfg['epochs'],
+        eta_min=cfg.get('lr_min', 1e-5),
+    )
+    # Restore scheduler state if resuming
+    if args.resume and start_epoch > 0:
+        for _ in range(start_epoch):
+            scheduler.step()
+
+    # ---- Loss -------------------------------------------------------------
+    compute_loss = build_loss(cfg)
+
+    # ---- Training loop ----------------------------------------------------
+    iter_step = cfg.get('iter_step', 100)
+    val_every = cfg.get('val_every', 10)
+    save_freq = cfg.get('save_freq', 10)
+
+    if is_main:
+        logger.info('Training started.\n')
+
+    for epoch in range(start_epoch + 1, cfg['epochs'] + 1):
+        if args.distributed:
+            sampler.set_epoch(epoch)
+
+        model.train()
+        epoch_loss = 0.0
+        t0 = time.time()
+
+        for it, batch in enumerate(loader):
+            batch = batch.to(device)               # (B, 1, p, p)
+            B = batch.shape[0]
+            x_flat = batch.view(B, -1)             # (B, N)
+            y = x_flat @ Phi.T                     # (B, M) — forward measurement
+
+            pred = model(y, Phi)                   # (B, 1, p, p)
+            loss = compute_loss(pred, batch, y, Phi)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+            if is_main and it % iter_step == 0:
+                lr = optimizer.param_groups[0]['lr']
+                logger.info(
+                    f'epoch {epoch:<3d}  iter {it:<4d}  '
+                    f'loss {loss.item():.5f}  lr {lr:.6f}'
+                )
+
+        scheduler.step()
+
+        if is_main:
+            elapsed  = time.time() - t0
+            avg_loss = epoch_loss / (it + 1)
+            lr       = optimizer.param_groups[0]['lr']
+            msg      = (f'epoch {epoch:<3d}  avg_loss {avg_loss:.5f}  '
+                        f'lr {lr:.6f}  time {elapsed:.1f}s')
+
+            if epoch % val_every == 0:
+                net = model.module if args.distributed else model
+                val_psnr = validate(
+                    net, Phi, cfg['val_dir'],
+                    cfg['patch_size'], device
+                )
+                if val_psnr is not None:
+                    msg += f'  val_psnr {val_psnr:.2f} dB'
                     net_to_save = model.module if args.distributed else model
-                    torch.save(net_to_save.state_dict(), best_path)
-                    msg += '  [best]'
-        logger.info(msg + '\n')
+                    if val_psnr > best_psnr:
+                        best_psnr = val_psnr
+                        torch.save(
+                            {'epoch': epoch, 'model': net_to_save.state_dict(),
+                             'best_psnr': best_psnr},
+                            best_path
+                        )
+                        msg += '  [best]'
 
-        if epoch % 5 == 0:
-            net_to_save = model.module if args.distributed else model
-            torch.save(net_to_save.state_dict(), f'{ckpt_prefix}_epoch{epoch}.pth')
+            if epoch % save_freq == 0:
+                net_to_save = model.module if args.distributed else model
+                ckpt_path = os.path.join(ckpt_dir, f'epoch{epoch}_cr{cr_pct}.pth')
+                torch.save(
+                    {'epoch': epoch, 'model': net_to_save.state_dict(),
+                     'best_psnr': best_psnr},
+                    ckpt_path
+                )
 
-if is_main:
-    logger.info(f'Training finished. Best val PSNR: {best_psnr:.2f} dB')
+            logger.info(msg + '\n')
 
-if args.distributed:
-    dist.destroy_process_group()
+    if is_main:
+        logger.info(f'Training finished. Best val PSNR: {best_psnr:.2f} dB')
+        logger.info(f'Best checkpoint: {best_path}')
+
+    if args.distributed:
+        dist.destroy_process_group()
+
+
+if __name__ == '__main__':
+    main()

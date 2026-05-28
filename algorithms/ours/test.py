@@ -1,141 +1,177 @@
+"""Testing entry point for LoRA-DUN variants.
+
+Usage:
+    python test.py --config configs/base_dun.yaml --cr 0.10 \\
+                   --ckpt ../../results/ours/base_dun/cr10/<run_id>/checkpoints/best_cr10.pth
+
+    # Also evaluate on BSD68:
+    python test.py --config configs/base_dun.yaml --cr 0.10 --ckpt <path> --bsd68
+"""
 import os
+import sys
 import glob
 import argparse
+import math
+import yaml
 import numpy as np
 import scipy.io as sio
-import cv2
 import torch
-import torch.nn as nn
-from time import time
 
-from model import MGSPINet
-from utils import imread_cs, img2col, col2im, compute_psnr, compute_ssim
+sys.path.insert(0, os.path.dirname(__file__))
+from lora_dun import build_model
+from dataset import load_test_image, img_to_blocks, blocks_to_img
 
-parser = argparse.ArgumentParser(description='Test MG-SPINet')
-parser.add_argument('--cs_ratio',   type=int,   default=25, choices=[1, 4, 10, 25, 30, 40, 50])
-parser.add_argument('--num_layers', type=int,   default=9)
-parser.add_argument('--channels',   type=int,   default=32)
-parser.add_argument('--epoch_num',  type=int,   default=200)
-parser.add_argument('--use_best',   action='store_true', help='load best_model.pth')
-parser.add_argument('--gpu',        type=str,   default='0')
-parser.add_argument('--test_set',   type=str,   default='Set11')
-parser.add_argument('--data_dir',   type=str,   default='../../data/test')
-parser.add_argument('--matrix_dir', type=str,   default='../../matrices')
-parser.add_argument('--base_dir',   type=str,   default='../../results/ours')
-parser.add_argument('--run_id',     type=str,   default='', help='run timestamp folder; default: auto latest')
-args = parser.parse_args()
+torch.set_float32_matmul_precision('highest')
 
-def find_latest_run(base_dir):
-    runs = sorted([
-        d for d in os.listdir(base_dir)
-        if os.path.isdir(os.path.join(base_dir, d, 'checkpoints'))
-    ])
-    return runs[-1] if runs else None
-
-run_id = args.run_id
-if not run_id:
-    run_id = find_latest_run(args.base_dir)
-    if run_id is None:
-        raise FileNotFoundError(f'No runs found in {args.base_dir}')
-    print(f'Auto-selected run: {run_id}')
-
-run_dir = os.path.join(args.base_dir, run_id)
-print(f'Run dir: {run_dir}')
-
-os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
-
-try:
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32       = False
-except Exception:
-    pass
 
 # ---------------------------------------------------------------------------
-# Load Phi and Qinit
+# Metrics
 # ---------------------------------------------------------------------------
-phi_path   = os.path.join(args.matrix_dir, f'phi_0_{args.cs_ratio}_1089.mat')
-Phi_np     = sio.loadmat(phi_path)['phi'].astype(np.float32)
-qinit_path = os.path.join(args.matrix_dir, f'Initialization_Matrix_{args.cs_ratio}.mat')
-Qinit_np   = sio.loadmat(qinit_path)['Qinit'].astype(np.float32)
 
-Phi   = torch.from_numpy(Phi_np).to(device)
-Qinit = torch.from_numpy(Qinit_np).to(device)
+def compute_psnr(img1: np.ndarray, img2: np.ndarray) -> float:
+    mse = np.mean((img1 - img2) ** 2)
+    return 100.0 if mse == 0 else 20 * math.log10(1.0 / math.sqrt(mse))
 
-# ---------------------------------------------------------------------------
-# Load model
-# ---------------------------------------------------------------------------
-ckpt_prefix = f'mgspi_layer{args.num_layers}_ch{args.channels}_ratio{args.cs_ratio}'
-ckpt_dir    = os.path.join(run_dir, 'checkpoints')
-if args.use_best:
-    ckpt_path = os.path.join(ckpt_dir, f'{ckpt_prefix}_best.pth')
-else:
-    ckpt_path = os.path.join(ckpt_dir, f'{ckpt_prefix}_epoch{args.epoch_num}.pth')
-model = MGSPINet(num_layers=args.num_layers, channels=args.channels)
-model = nn.DataParallel(model).to(device)
-model.load_state_dict(torch.load(ckpt_path, map_location=device))
-model.eval()
-print(f'Loaded: {ckpt_path}')
+
+def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
+    from skimage.metrics import structural_similarity
+    return structural_similarity(img1, img2, data_range=1.0)
+
 
 # ---------------------------------------------------------------------------
-# Test
+# Per-dataset evaluation
 # ---------------------------------------------------------------------------
-test_dir  = os.path.join(args.data_dir, args.test_set)
-img_paths = sorted(glob.glob(os.path.join(test_dir, '*.tif')) +
-                   glob.glob(os.path.join(test_dir, '*.png')) +
-                   glob.glob(os.path.join(test_dir, '*.bmp')))
 
-save_dir = os.path.join(run_dir, 'images', args.test_set, f'ratio_{args.cs_ratio}')
-log_dir  = os.path.join(run_dir, 'logs')
-os.makedirs(save_dir, exist_ok=True)
-os.makedirs(log_dir,  exist_ok=True)
+def evaluate(model, Phi, img_dir: str, patch_size: int,
+             device, save_dir: str = None, batch_size: int = 64) -> dict:
+    img_paths = sorted(
+        glob.glob(os.path.join(img_dir, '*.tif')) +
+        glob.glob(os.path.join(img_dir, '*.png')) +
+        glob.glob(os.path.join(img_dir, '*.bmp'))
+    )
+    if not img_paths:
+        print(f'  No images found in {img_dir}')
+        return {}
 
-psnr_list, ssim_list = [], []
-print(f'\nTesting MGSPINet | {args.test_set} | ratio={args.cs_ratio}% | {len(img_paths)} images\n')
+    results = {}
+    model.eval()
+    with torch.no_grad():
+        for path in img_paths:
+            name = os.path.splitext(os.path.basename(path))[0]
+            img  = load_test_image(path)
+            blocks, ph, pw, h0, w0 = img_to_blocks(img, patch_size)
 
-with torch.no_grad():
-    for idx, img_path in enumerate(img_paths):
-        img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        img_yuv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2YCrCb)
-        Iorg_y  = img_yuv[:, :, 0]
+            rec_blocks = []
+            for i in range(0, len(blocks), batch_size):
+                chunk = torch.from_numpy(blocks[i:i+batch_size]).to(device)
+                y     = chunk @ Phi.T
+                out   = model(y, Phi)
+                rec_blocks.append(
+                    out.squeeze(1).view(-1, patch_size * patch_size).cpu().numpy()
+                )
 
-        Iorg, row, col, Ipad, row_new, col_new = imread_cs(Iorg_y)
-        Icol = img2col(Ipad) / 255.0
+            rec_blocks = np.concatenate(rec_blocks, axis=0)
+            rec_img    = blocks_to_img(rec_blocks, ph, pw, h0, w0, patch_size)
 
-        batch = torch.from_numpy(Icol.astype(np.float32)).to(device)
-        Phix  = torch.mm(batch, Phi.T)
+            psnr = compute_psnr(rec_img, img)
+            ssim = compute_ssim(rec_img, img)
+            results[name] = {'psnr': psnr, 'ssim': ssim}
 
-        t0 = time()
-        x_out, _ = model(Phix, Phi, Qinit)
-        elapsed  = time() - t0
+            if save_dir:
+                os.makedirs(save_dir, exist_ok=True)
+                save_path = os.path.join(save_dir, f'{name}_rec.png')
+                import cv2
+                cv2.imwrite(save_path, (rec_img * 255).astype(np.uint8))
 
-        pred  = x_out.cpu().numpy()
-        X_rec = np.clip(col2im(pred, row, col, row_new, col_new), 0, 1)
+    return results
 
-        psnr_val = compute_psnr(X_rec * 255, Iorg.astype(np.float64))
-        ssim_val = compute_ssim(X_rec * 255, Iorg.astype(np.float64))
-        psnr_list.append(psnr_val)
-        ssim_list.append(ssim_val)
 
-        print(f'[{idx+1:02d}/{len(img_paths)}] {os.path.basename(img_path):20s} '
-              f'PSNR={psnr_val:.2f}  SSIM={ssim_val:.4f}  t={elapsed:.3f}s')
+def print_results(title: str, results: dict):
+    if not results:
+        return
+    line = '─' * 52
+    print(f'\n{line}')
+    print(f'  {title}')
+    print(line)
+    print(f'  {"Image":<20}  {"PSNR":>7}  {"SSIM":>7}')
+    print(line)
+    psnrs, ssims = [], []
+    for name, v in results.items():
+        print(f'  {name:<20}  {v["psnr"]:>7.2f}  {v["ssim"]:>7.4f}')
+        psnrs.append(v['psnr'])
+        ssims.append(v['ssim'])
+    print(line)
+    print(f'  {"Average":<20}  {np.mean(psnrs):>7.2f}  {np.mean(ssims):>7.4f}')
+    print(f'{line}\n')
 
-        img_rec_yuv          = img_yuv.copy()
-        img_rec_yuv[:, :, 0] = (X_rec * 255).astype(np.uint8)
-        img_rec_bgr          = cv2.cvtColor(img_rec_yuv, cv2.COLOR_YCrCb2BGR)
-        base                 = os.path.splitext(os.path.basename(img_path))[0]
-        cv2.imwrite(
-            os.path.join(save_dir, f'{base}_PSNR{psnr_val:.2f}_SSIM{ssim_val:.4f}.png'),
-            img_rec_bgr
-        )
 
-avg_psnr = np.mean(psnr_list)
-avg_ssim = np.mean(ssim_list)
-summary  = (f'\nAvg PSNR={avg_psnr:.2f}  Avg SSIM={avg_ssim:.4f} '
-            f'| set={args.test_set}  ratio={args.cs_ratio}%  epoch={args.epoch_num}\n')
-print(summary)
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
-log_path = os.path.join(log_dir, f'test_{args.test_set}_ratio{args.cs_ratio}.txt')
-with open(log_path, 'a') as f:
-    f.write(summary)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', type=str, required=True)
+    parser.add_argument('--cr',     type=float, default=None)
+    parser.add_argument('--ckpt',   type=str,   required=True)
+    parser.add_argument('--gpu',    type=str,   default='0')
+    parser.add_argument('--bsd68',  action='store_true',
+                        help='Also evaluate on BSD68')
+    parser.add_argument('--save',   action='store_true',
+                        help='Save reconstructed images alongside checkpoint')
+    args = parser.parse_args()
+
+    with open(args.config) as f:
+        cfg = yaml.safe_load(f)
+    if args.cr is not None:
+        cfg['cr'] = args.cr
+
+    cr     = cfg['cr']
+    cr_pct = int(round(cr * 100))
+
+    os.environ['CUDA_DEVICE_ORDER']    = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+    # ---- Matrix -----------------------------------------------------------
+    N        = cfg['patch_size'] ** 2
+    mat_file = os.path.join(cfg['matrix_dir'], f'phi_{cr}_{N}.mat')
+    Phi_np   = sio.loadmat(mat_file)['phi'].astype(np.float32)
+    Phi      = torch.from_numpy(Phi_np).to(device)
+
+    # ---- Model ------------------------------------------------------------
+    model = build_model(cfg).to(device)
+    ckpt  = torch.load(args.ckpt, map_location=device)
+    model.load_state_dict(ckpt['model'])
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+
+    print(f'\nModel  : {cfg["model_name"]}  ({total_params:.2f} M params)')
+    print(f'CR     : {cr_pct}%')
+    print(f'Ckpt   : {args.ckpt}')
+
+    # ---- Evaluate Set11 --------------------------------------------------
+    save_dir = None
+    if args.save:
+        ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
+        save_dir  = os.path.join(os.path.dirname(args.ckpt),
+                                 f'rec_set11_{ckpt_name}')
+    results = evaluate(model, Phi, cfg['val_dir'],
+                       cfg['patch_size'], device, save_dir)
+    print_results(f'Set11  (CR={cr_pct}%)', results)
+
+    # ---- Evaluate BSD68 --------------------------------------------------
+    if args.bsd68:
+        bsd68_dir = os.path.join(os.path.dirname(cfg['val_dir']), 'BSD68')
+        if not os.path.isdir(bsd68_dir):
+            bsd68_dir = cfg.get('bsd68_dir', bsd68_dir)
+        if args.save:
+            ckpt_name = os.path.splitext(os.path.basename(args.ckpt))[0]
+            save_dir  = os.path.join(os.path.dirname(args.ckpt),
+                                     f'rec_bsd68_{ckpt_name}')
+        res68 = evaluate(model, Phi, bsd68_dir,
+                         cfg['patch_size'], device, save_dir)
+        print_results(f'BSD68  (CR={cr_pct}%)', res68)
+
+
+if __name__ == '__main__':
+    main()

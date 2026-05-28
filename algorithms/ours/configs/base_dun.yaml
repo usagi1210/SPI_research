@@ -1,0 +1,33 @@
+# Stage 0: Base-DUN
+# 10 independent U-Nets, no parameter sharing, no LoRA.
+
+model_name: BaseDUN
+num_stages: 10
+channels: [32, 64, 128]
+patch_size: 64
+
+# Training
+epochs: 100
+batch_size: 32
+lr: 1.0e-3
+lr_min: 1.0e-5
+scheduler: cosine
+loss: l1
+recon_weight: 1.0
+consistency_weight: 0.0
+patches_per_image: 50
+
+# Data paths (relative to algorithms/ours/)
+train_dir: ../../data/train/BSD400
+val_dir:   ../../data/test/Set11
+matrix_dir: ../../matrices
+result_dir: ../../results/ours/base_dun
+
+# Compression ratio (overridable via --cr)
+cr: 0.10
+
+# Logging / checkpointing
+val_every: 10
+save_freq: 10
+iter_step: 100
+num_workers: 4
