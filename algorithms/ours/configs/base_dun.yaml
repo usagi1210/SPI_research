@@ -27,7 +27,7 @@ result_dir: ../../results/ours/base_dun
 cr: 0.10
 
 # Logging / checkpointing
-val_every: 10
+val_every: 1
 save_freq: 10
 iter_step: 100
 num_workers: 4
