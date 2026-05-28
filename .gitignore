@@ -49,4 +49,5 @@ checkpoints/
 Thumbs.db
 
 # 本地项目文档（不上传）
+doc/
 CLAUDE.md
