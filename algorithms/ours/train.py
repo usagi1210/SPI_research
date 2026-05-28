@@ -239,8 +239,24 @@ def main():
         best_psnr   = ckpt.get('best_psnr', 0.0)
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
-        if 'scheduler' in ckpt:
+
+        saved_total = ckpt.get('total_epochs', start_epoch)
+        if saved_total < cfg['epochs']:
+            # Training is being extended: reinitialize scheduler for the
+            # remaining epochs so LR restarts from cfg['lr'] instead of
+            # staying pinned at lr_min from the completed cosine cycle.
+            remaining = cfg['epochs'] - start_epoch
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=remaining, eta_min=cfg.get('lr_min', 1e-5),
+            )
+            if is_main:
+                logger.info(
+                    f'Scheduler reinitialized: fresh cosine over {remaining} epochs '
+                    f'(epochs {start_epoch+1}–{cfg["epochs"]})'
+                )
+        elif 'scheduler' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler'])
+
         if is_main:
             logger.info(f'Resumed from {args.resume} (epoch {start_epoch})')
 
@@ -325,7 +341,8 @@ def main():
                 {'epoch': epoch, 'model': net.state_dict(),
                  'optimizer': optimizer.state_dict(),
                  'scheduler': scheduler.state_dict(),
-                 'best_psnr': best_psnr},
+                 'best_psnr': best_psnr,
+                 'total_epochs': cfg['epochs']},
                 os.path.join(ckpt_dir, f'latest_cr{cr_pct}.pth')
             )
 
