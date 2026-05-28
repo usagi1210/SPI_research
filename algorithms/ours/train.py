@@ -65,61 +65,65 @@ def compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Validation  (test every epoch, save gt|rec side-by-side images)
+# Validation + visualisation
 # ---------------------------------------------------------------------------
 
-def validate(model, Phi, val_dir: str, patch_size: int,
-             device, save_dir: str = None,
-             batch_size: int = 64) -> tuple[float, float]:
-    """
-    Returns (mean_psnr, mean_ssim).
-    If save_dir is given, writes  gt | rec  PNG for each test image.
-    """
-    img_paths = sorted(
+def _get_img_paths(val_dir: str) -> list:
+    return sorted(
         glob.glob(os.path.join(val_dir, '*.tif')) +
         glob.glob(os.path.join(val_dir, '*.png')) +
         glob.glob(os.path.join(val_dir, '*.bmp'))
     )
+
+
+def _reconstruct(model, Phi, img_path: str, patch_size: int,
+                 device, batch_size: int = 64):
+    """Return (orig_img, rec_img) both float [0,1]."""
+    img = load_test_image(img_path)
+    blocks, ph, pw, h0, w0 = img_to_blocks(img, patch_size)
+    rec_blocks = []
+    with torch.no_grad():
+        for i in range(0, len(blocks), batch_size):
+            chunk = torch.from_numpy(blocks[i:i+batch_size]).to(device)
+            out   = model(chunk @ Phi.T, Phi)
+            rec_blocks.append(
+                out.squeeze(1).view(-1, patch_size * patch_size).cpu().numpy()
+            )
+    rec_img = blocks_to_img(np.concatenate(rec_blocks, 0), ph, pw, h0, w0, patch_size)
+    return img, rec_img
+
+
+def validate(model, Phi, val_dir: str, patch_size: int,
+             device, batch_size: int = 64) -> tuple:
+    """Returns (mean_psnr, mean_ssim). Model is set back to train mode after."""
+    img_paths = _get_img_paths(val_dir)
     if not img_paths:
         return None, None
 
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-
     model.eval()
     psnr_list, ssim_list = [], []
-
-    with torch.no_grad():
-        for path in img_paths:
-            name   = os.path.splitext(os.path.basename(path))[0]
-            img    = load_test_image(path)                          # float [0,1]
-            blocks, ph, pw, h0, w0 = img_to_blocks(img, patch_size)
-
-            rec_blocks = []
-            for i in range(0, len(blocks), batch_size):
-                chunk = torch.from_numpy(blocks[i:i+batch_size]).to(device)
-                y     = chunk @ Phi.T
-                out   = model(y, Phi)
-                rec_blocks.append(
-                    out.squeeze(1).view(-1, patch_size * patch_size).cpu().numpy()
-                )
-
-            rec_blocks = np.concatenate(rec_blocks, axis=0)
-            rec_img    = blocks_to_img(rec_blocks, ph, pw, h0, w0, patch_size)
-
-            psnr_list.append(compute_psnr(rec_img, img))
-            ssim_list.append(compute_ssim(rec_img, img))
-
-            if save_dir:
-                # Side-by-side: original (left) | reconstructed (right)
-                vis = np.concatenate([img, rec_img], axis=1)
-                cv2.imwrite(
-                    os.path.join(save_dir, f'{name}.png'),
-                    (vis * 255).astype(np.uint8)
-                )
-
+    for path in img_paths:
+        img, rec = _reconstruct(model, Phi, path, patch_size, device, batch_size)
+        psnr_list.append(compute_psnr(rec, img))
+        ssim_list.append(compute_ssim(rec, img))
     model.train()
     return float(np.mean(psnr_list)), float(np.mean(ssim_list))
+
+
+def save_vis(model, Phi, val_dir: str, patch_size: int,
+             device, save_dir: str, epoch: int, batch_size: int = 64):
+    """Save gt | rec side-by-side PNGs. Called only on new-best epochs."""
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    for path in _get_img_paths(val_dir):
+        name = os.path.splitext(os.path.basename(path))[0]
+        img, rec = _reconstruct(model, Phi, path, patch_size, device, batch_size)
+        vis = np.concatenate([img, rec], axis=1)
+        cv2.imwrite(
+            os.path.join(save_dir, f'{name}_ep{epoch:03d}.png'),
+            (vis * 255).astype(np.uint8)
+        )
+    model.train()
 
 
 # ---------------------------------------------------------------------------
@@ -291,14 +295,11 @@ def main():
             msg = (f'epoch {epoch:<3d}  avg_loss {avg_loss:.5f}  '
                    f'lr {optimizer.param_groups[0]["lr"]:.6f}  time {elapsed:.1f}s')
 
-            # ---- Validation + visualisation --------------------------------
+            # ---- Validation ------------------------------------------------
             if epoch % val_every == 0:
-                net     = model.module if args.distributed else model
-                vis_dir = os.path.join(vis_root, f'epoch_{epoch:03d}')
-                psnr, ssim = validate(
-                    net, Phi, cfg['val_dir'], cfg['patch_size'],
-                    device, save_dir=vis_dir,
-                )
+                net = model.module if args.distributed else model
+                psnr, ssim = validate(net, Phi, cfg['val_dir'],
+                                      cfg['patch_size'], device)
                 if psnr is not None:
                     msg += f'  psnr {psnr:.2f} dB  ssim {ssim:.4f}'
                     if psnr > best_psnr:
@@ -308,6 +309,9 @@ def main():
                              'best_psnr': best_psnr},
                             best_path
                         )
+                        # Visualise only on new-best epochs (overwrites vis/best/)
+                        save_vis(net, Phi, cfg['val_dir'], cfg['patch_size'],
+                                 device, os.path.join(vis_root, 'best'), epoch)
                         msg += '  [best]'
 
             # ---- Periodic named checkpoint ---------------------------------
