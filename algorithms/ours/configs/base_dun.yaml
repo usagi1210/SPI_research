@@ -7,7 +7,7 @@ channels: [32, 64, 128]
 patch_size: 64
 
 # Training
-epochs: 100
+epochs: 200
 batch_size: 32
 lr: 1.0e-3
 lr_min: 1.0e-5
