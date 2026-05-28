@@ -206,14 +206,6 @@ def main():
     best_psnr   = 0.0
     best_path   = os.path.join(ckpt_dir, f'best_cr{cr_pct}.pth')
 
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt['model'])
-        start_epoch = ckpt.get('epoch', 0)
-        best_psnr   = ckpt.get('best_psnr', 0.0)
-        if is_main:
-            logger.info(f'Resumed from {args.resume} (epoch {start_epoch})')
-
     if args.distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
@@ -224,10 +216,19 @@ def main():
         T_max=cfg['epochs'],
         eta_min=cfg.get('lr_min', 1e-5),
     )
-    # Restore scheduler state if resuming
-    if args.resume and start_epoch > 0:
-        for _ in range(start_epoch):
-            scheduler.step()
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        net = model.module if args.distributed else model
+        net.load_state_dict(ckpt['model'])
+        start_epoch = ckpt.get('epoch', 0)
+        best_psnr   = ckpt.get('best_psnr', 0.0)
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        if is_main:
+            logger.info(f'Resumed from {args.resume} (epoch {start_epoch})')
 
     # ---- Loss -------------------------------------------------------------
     compute_loss = build_loss(cfg)
@@ -305,6 +306,16 @@ def main():
                      'best_psnr': best_psnr},
                     ckpt_path
                 )
+
+            # Always overwrite latest.pth for crash recovery
+            net_to_save = model.module if args.distributed else model
+            torch.save(
+                {'epoch': epoch, 'model': net_to_save.state_dict(),
+                 'optimizer': optimizer.state_dict(),
+                 'scheduler': scheduler.state_dict(),
+                 'best_psnr': best_psnr},
+                os.path.join(ckpt_dir, f'latest_cr{cr_pct}.pth')
+            )
 
             logger.info(msg + '\n')
 
