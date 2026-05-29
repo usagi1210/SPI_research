@@ -1,0 +1,35 @@
+# Stage 2: LoRA-DUN-fixed
+# Shared backbone + stage-specific LoRA adapters on all Conv layers (rank=4).
+# No condition variable. Ablation over rank is done separately.
+
+model_name: LoRADUNFixed
+num_stages: 10
+channels: [32, 64, 128]
+patch_size: 64
+lora_rank: 4
+
+# Training
+epochs: 200
+batch_size: 32
+lr: 1.0e-3
+lr_min: 1.0e-5
+scheduler: cosine
+loss: l1
+recon_weight: 1.0
+consistency_weight: 0.0
+patches_per_image: 50
+
+# Data paths (relative to algorithms/ours/)
+train_dir: ../../data/train/BSD400
+val_dir:   ../../data/test/Set11
+matrix_dir: ../../matrices
+result_dir: ../../results/ours/lora_dun_fixed
+
+# Compression ratio (overridable via --cr)
+cr: 0.10
+
+# Logging / checkpointing
+val_every: 1
+save_freq: 10
+iter_step: 100
+num_workers: 4

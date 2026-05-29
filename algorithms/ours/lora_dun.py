@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from backbone import LightUNet
 from unfolding import ISTAStep
+from lora import LoRABank, unet_with_lora
 
 
 class BaseDUN(nn.Module):
@@ -54,6 +55,48 @@ class SharedDUN(nn.Module):
         return x.view(y.shape[0], 1, H, W)
 
 
+class LoRADUNFixed(nn.Module):
+    """Stage 2: shared backbone + stage-specific LoRA adapters (fixed rank).
+
+    All 10 stages share ONE LightUNet backbone. Each stage additionally has
+    its own LoRABank that adds ΔW_k = B_k @ A_k to every Conv layer.
+    The effective denoiser at stage k is: W_base + ΔW_k.
+
+    Parameter budget (rank=4, channels=[32,64,128]):
+        backbone  : ~0.43 M  (shared, counted once)
+        LoRA banks: 10 × ~26 K ≈ 0.26 M
+        alphas    : 10 scalars
+        total     : ~0.69 M  (vs 4.3 M for Base-DUN)
+    """
+
+    def __init__(self, num_stages: int = 10, channels=(32, 64, 128),
+                 patch_size: int = 64, rank: int = 4):
+        super().__init__()
+        self.num_stages = num_stages
+        self.patch_size = patch_size
+        self.backbone   = LightUNet(channels)
+        self.lora_banks = nn.ModuleList(
+            [LoRABank(channels, rank) for _ in range(num_stages)]
+        )
+        self.alphas = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.1)) for _ in range(num_stages)]
+        )
+
+    def forward(self, y: torch.Tensor, Phi: torch.Tensor) -> torch.Tensor:
+        H = W = self.patch_size
+        B = y.shape[0]
+        x = y @ Phi  # back-projection init
+
+        for k in range(self.num_stages):
+            Phix = x @ Phi.T
+            grad = (Phix - y) @ Phi
+            r    = x - self.alphas[k] * grad
+            x    = unet_with_lora(self.backbone, self.lora_banks[k],
+                                  r.view(B, 1, H, W)).view(B, H * W).clamp(0., 1.)
+
+        return x.view(B, 1, H, W)
+
+
 def build_model(cfg: dict) -> nn.Module:
     name = cfg.get('model_name', 'BaseDUN')
     kwargs = dict(
@@ -65,4 +108,6 @@ def build_model(cfg: dict) -> nn.Module:
         return BaseDUN(**kwargs)
     if name == 'SharedDUN':
         return SharedDUN(**kwargs)
+    if name == 'LoRADUNFixed':
+        return LoRADUNFixed(**kwargs, rank=cfg.get('lora_rank', 4))
     raise ValueError(f'Unknown model: {name}')
