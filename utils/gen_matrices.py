@@ -17,7 +17,8 @@ PATCH_SIZE     = 64          # 64×64 patches
 N              = PATCH_SIZE ** 2   # 4096
 
 
-def gen_matrix(cr: float, N: int, seed: int = 42) -> np.ndarray:
+def gen_matrix(cr: float, N: int, seed: int) -> np.ndarray:
+    """Each CR gets an independent matrix derived from its own seed."""
     rng = np.random.default_rng(seed)
     M   = max(1, int(round(cr * N)))
     Phi = rng.standard_normal((M, N)).astype(np.float32)
@@ -25,6 +26,13 @@ def gen_matrix(cr: float, N: int, seed: int = 42) -> np.ndarray:
     norms = np.linalg.norm(Phi, axis=1, keepdims=True)
     Phi   = Phi / norms
     return Phi
+
+
+def cr_to_seed(cr: float, base_seed: int = 42) -> int:
+    """Derive a deterministic per-CR seed from the base seed.
+    e.g. cr=0.10, base=42  →  seed = 42 + int(0.10*100) = 52
+    """
+    return base_seed + int(round(cr * 100))
 
 
 def main():
@@ -38,11 +46,12 @@ def main():
     os.makedirs(args.save_dir, exist_ok=True)
 
     for cr in args.rates:
-        Phi      = gen_matrix(cr, N, args.seed)
+        seed     = cr_to_seed(cr, args.seed)
+        Phi      = gen_matrix(cr, N, seed)
         filename = f'phi_{cr}_{N}.mat'
         out_path = os.path.join(args.save_dir, filename)
         sio.savemat(out_path, {'phi': Phi})
-        print(f'Saved {filename}  shape={Phi.shape}  M={Phi.shape[0]}')
+        print(f'Saved {filename}  shape={Phi.shape}  seed={seed}')
 
     print(f'\nAll matrices saved to: {os.path.abspath(args.save_dir)}')
 
