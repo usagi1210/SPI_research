@@ -52,6 +52,6 @@ Thumbs.db
 doc/
 CLAUDE.md
 
-# 对比算法仓库（本地克隆，不嵌套上传）
+# 对比算法仓库（本地克隆，暂不上传；跑对比实验前从此处移除）
 algorithms/SAUNet/
-algorithms/SAUNet/.git/
+algorithms/OCTUF/
