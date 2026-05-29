@@ -128,12 +128,17 @@ def validate(model, Phi, val_dir: str, patch_size: int,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config',      type=str, required=True)
-    parser.add_argument('--cr',          type=float, default=None)
-    parser.add_argument('--gpu',         type=str,  default='0')
-    parser.add_argument('--distributed', action='store_true')
-    parser.add_argument('--resume',      type=str,  default=None)
-    parser.add_argument('--run_id',      type=str,  default=None)
+    parser.add_argument('--config',          type=str, required=True)
+    parser.add_argument('--cr',              type=float, default=None)
+    parser.add_argument('--gpu',             type=str,  default='0')
+    parser.add_argument('--distributed',     action='store_true')
+    parser.add_argument('--resume',          type=str,  default=None)
+    parser.add_argument('--run_id',          type=str,  default=None)
+    parser.add_argument('--backbone_ckpt',   type=str,  default=None,
+                        help='Checkpoint to warm-start the shared backbone '
+                             '(SharedDUN or LoRADUNFixed format)')
+    parser.add_argument('--freeze_backbone', action='store_true',
+                        help='Freeze backbone after loading; only train LoRA + alphas')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -223,11 +228,32 @@ def main():
     best_epoch  = 0
     best_path   = os.path.join(ckpt_dir, f'best_cr{cr_pct}.pth')
 
+    # ---- Backbone warm-start (two-stage training) -------------------------
+    if args.backbone_ckpt and hasattr(model, 'backbone'):
+        _state = torch.load(args.backbone_ckpt, map_location=device)['model']
+        if any(k.startswith('stages.0.denoiser.') for k in _state):
+            _pfx = 'stages.0.denoiser.'   # SharedDUN format
+        elif any(k.startswith('backbone.') for k in _state):
+            _pfx = 'backbone.'            # LoRADUNFixed format
+        else:
+            raise ValueError(f'Unrecognised backbone format in {args.backbone_ckpt}')
+        _bw = {k[len(_pfx):]: v for k, v in _state.items() if k.startswith(_pfx)}
+        model.backbone.load_state_dict(_bw)
+        if is_main:
+            logger.info(f'Backbone loaded from {args.backbone_ckpt}  (prefix={_pfx!r})')
+
+    if args.freeze_backbone and hasattr(model, 'backbone'):
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        if is_main:
+            logger.info('Backbone frozen — training LoRA adapters + alphas only')
+
     if args.distributed:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     # ---- Optimiser + scheduler -------------------------------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg['lr'])
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable, lr=cfg['lr'])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg['epochs'], eta_min=cfg.get('lr_min', 1e-5),
     )
