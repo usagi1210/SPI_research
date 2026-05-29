@@ -55,3 +55,4 @@ CLAUDE.md
 # 对比算法仓库（本地克隆，暂不上传；跑对比实验前从此处移除）
 algorithms/SAUNet/
 algorithms/OCTUF/
+algorithms/TransCS/
