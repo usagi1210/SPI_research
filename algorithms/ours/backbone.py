@@ -7,7 +7,7 @@ class ConvBnRelu(nn.Sequential):
     def __init__(self, in_ch, out_ch):
         super().__init__(
             nn.Conv2d(in_ch, out_ch, 3, padding=1, bias=False),
-            nn.BatchNorm2d(out_ch),
+            nn.InstanceNorm2d(out_ch, affine=True),
             nn.ReLU(inplace=True),
         )
 
