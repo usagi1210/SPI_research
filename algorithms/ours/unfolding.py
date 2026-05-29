@@ -18,10 +18,13 @@ class ISTAStep(nn.Module):
         Phi : (M, N)  measurement matrix
         Returns (B, N) updated estimate.
         """
+        # Clamp alpha to (0, 0.5]: ensures ISTA converges for typical Phi
+        alpha = self.alpha.abs().clamp(max=0.5)
+
         # Gradient of 0.5 * ||Phi x - y||^2 w.r.t. x
         Phix = x @ Phi.T            # (B, M)
         grad = (Phix - y) @ Phi     # (B, N) = Phi^T (Phi x - y)
-        r = x - self.alpha * grad   # gradient descent
+        r = x - alpha * grad        # gradient descent
 
         # Proximal operator via U-Net
         B = x.shape[0]
