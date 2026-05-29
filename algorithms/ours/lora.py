@@ -1,9 +1,12 @@
-"""LoRA adapters for LightUNet.
+"""LoRA adapters for LightUNet, plus condition MLP for Stage 3.
 
 Each LoRABank holds one pair (A, B) per Conv layer in LightUNet.
 The effective weight at stage k is:  W_k = W_base + B_k @ A_k (reshaped).
 
 A is zero-init, B is Kaiming-uniform → ΔW = 0 at the start of training.
+
+ConditionMLP maps a scalar condition c^(k) to a denoiser scale s^(k) ∈ (0, 2).
+Initialized to output 1.0 (identical to Stage 2 at the start).
 """
 import math
 import torch
@@ -73,3 +76,27 @@ def unet_with_lora(unet, lora: LoRABank, x: torch.Tensor) -> torch.Tensor:
     d = F.conv2d(torch.cat([d, e1], dim=1), w, unet.dec1.bias,
                  unet.dec1.stride, unet.dec1.padding)
     return d
+
+
+class ConditionMLP(nn.Module):
+    """Maps scalar condition c^(k) → denoiser scale s^(k) ∈ (0, 2).
+
+    Initialized so that s ≡ 1.0 at the start (2·sigmoid(0) = 1),
+    matching Stage 2 (LoRADUNFixed) behaviour exactly before training.
+    The network then learns to attenuate or amplify denoising per stage
+    based on the current reconstruction state.
+    """
+
+    def __init__(self, hidden: int = 16):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(1, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 1),
+        )
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)   # sigmoid(0) = 0.5 → 2×0.5 = 1.0
+
+    def forward(self, c: torch.Tensor) -> torch.Tensor:
+        """c : (B,) scalar condition → (B,) scale in (0, 2)"""
+        return 2.0 * torch.sigmoid(self.net(c.unsqueeze(-1))).squeeze(-1)

@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from backbone import LightUNet
 from unfolding import ISTAStep
-from lora import LoRABank, unet_with_lora
+from lora import LoRABank, ConditionMLP, unet_with_lora
 
 
 class BaseDUN(nn.Module):
@@ -99,6 +99,65 @@ class LoRADUNFixed(nn.Module):
         return x.view(B, 1, H, W)
 
 
+class LoRADUNCond(nn.Module):
+    """Stage 3: condition-dependent LoRA (shared backbone + LoRA + ConditionMLP).
+
+    At each stage k a scalar condition c^(k) is computed from the current
+    estimate and mapped by a per-stage MLP to a denoiser scale s^(k) ∈ (0,2):
+
+        x^{k+1} = r^k + s^k · UNet_k(r^k)
+
+    condition_type:
+        're'  (Stage 3A) — residual energy  e^(k) = mean(||Φx^k - y||²)
+        'mc'  (Stage 3B) — gradient norm²   g^(k) = mean(||Φᵀ(Φx^k-y)||²)
+
+    ConditionMLP is initialized so s ≡ 1 (same as LoRADUNFixed at start).
+    """
+
+    def __init__(self, num_stages: int = 10, channels=(32, 64, 128),
+                 patch_size: int = 64, rank: int = 4,
+                 condition_type: str = 're'):
+        super().__init__()
+        assert condition_type in ('re', 'mc')
+        self.num_stages     = num_stages
+        self.patch_size     = patch_size
+        self.condition_type = condition_type
+        self.backbone  = LightUNet(channels)
+        self.lora_banks = nn.ModuleList(
+            [LoRABank(channels, rank) for _ in range(num_stages)]
+        )
+        self.alphas    = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.1)) for _ in range(num_stages)]
+        )
+        self.cond_mlps = nn.ModuleList(
+            [ConditionMLP() for _ in range(num_stages)]
+        )
+
+    def forward(self, y: torch.Tensor, Phi: torch.Tensor) -> torch.Tensor:
+        H = W = self.patch_size
+        B = y.shape[0]
+        x = y @ Phi
+
+        for k in range(self.num_stages):
+            Phix     = x @ Phi.T
+            residual = Phix - y               # (B, M)
+            grad     = residual @ Phi         # (B, N)
+            r        = x - self.alphas[k] * grad
+
+            if self.condition_type == 're':
+                c_k = (residual ** 2).mean(dim=1)   # residual energy  (B,)
+            else:
+                c_k = (grad ** 2).mean(dim=1)       # gradient norm²   (B,)
+
+            s_k      = self.cond_mlps[k](c_k).view(B, 1, 1, 1)
+            r_spatial = r.view(B, 1, H, W)
+            x = (r_spatial + s_k * unet_with_lora(
+                    self.backbone, self.lora_banks[k], r_spatial)
+                 ).view(B, H * W).clamp(0., 1.)
+
+        return x.view(B, 1, H, W)
+
+
 def build_model(cfg: dict) -> nn.Module:
     name = cfg.get('model_name', 'BaseDUN')
     kwargs = dict(
@@ -112,4 +171,8 @@ def build_model(cfg: dict) -> nn.Module:
         return SharedDUN(**kwargs)
     if name == 'LoRADUNFixed':
         return LoRADUNFixed(**kwargs, rank=cfg.get('lora_rank', 4))
+    if name == 'LoRADUNCondRE':
+        return LoRADUNCond(**kwargs, rank=cfg.get('lora_rank', 4), condition_type='re')
+    if name == 'LoRADUNCondMC':
+        return LoRADUNCond(**kwargs, rank=cfg.get('lora_rank', 4), condition_type='mc')
     raise ValueError(f'Unknown model: {name}')
