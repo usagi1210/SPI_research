@@ -220,6 +220,7 @@ def main():
 
     start_epoch = 0
     best_psnr   = 0.0
+    best_epoch  = 0
     best_path   = os.path.join(ckpt_dir, f'best_cr{cr_pct}.pth')
 
     if args.distributed:
@@ -318,7 +319,8 @@ def main():
                 if psnr is not None:
                     msg += f'  psnr {psnr:.2f} dB  ssim {ssim:.4f}'
                     if psnr > best_psnr:
-                        best_psnr = psnr
+                        best_psnr  = psnr
+                        best_epoch = epoch
                         torch.save(
                             {'epoch': epoch, 'model': net.state_dict(),
                              'best_psnr': best_psnr},
@@ -349,7 +351,8 @@ def main():
             logger.info(msg + '\n')
 
     if is_main:
-        logger.info(f'Training finished. Best val PSNR: {best_psnr:.2f} dB')
+        logger.info(f'Training finished. Best val PSNR: {best_psnr:.2f} dB  '
+                    f'(epoch {best_epoch})')
         logger.info(f'Best checkpoint : {best_path}')
 
     if args.distributed:
