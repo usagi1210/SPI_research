@@ -88,11 +88,13 @@ class LoRADUNFixed(nn.Module):
         x = y @ Phi  # back-projection init
 
         for k in range(self.num_stages):
-            Phix = x @ Phi.T
-            grad = (Phix - y) @ Phi
-            r    = x - self.alphas[k] * grad
-            x    = unet_with_lora(self.backbone, self.lora_banks[k],
-                                  r.view(B, 1, H, W)).view(B, H * W).clamp(0., 1.)
+            Phix     = x @ Phi.T
+            grad     = (Phix - y) @ Phi
+            r        = x - self.alphas[k] * grad
+            r_spatial = r.view(B, 1, H, W)
+            # Residual learning: x_new = r + ΔUNet(r)
+            x = (r_spatial + unet_with_lora(self.backbone, self.lora_banks[k],
+                                            r_spatial)).view(B, H * W).clamp(0., 1.)
 
         return x.view(B, 1, H, W)
 

@@ -23,9 +23,9 @@ class ISTAStep(nn.Module):
         grad = (Phix - y) @ Phi     # (B, N) = Phi^T (Phi x - y)
         r = x - self.alpha * grad   # gradient descent
 
-        # Proximal operator via U-Net
+        # Proximal operator via U-Net (residual learning)
+        # x_new = r + denoiser(r): at init denoiser≈0, so x_new≈r (stable start)
         B = x.shape[0]
-        x_new = self.denoiser(r.view(B, 1, H, W)).view(B, H * W)
-        # Enforce physical bounds: pixel values must stay in [0, 1]
-        # Prevents extreme intermediate values from cascading across stages
+        r_spatial = r.view(B, 1, H, W)
+        x_new = (r_spatial + self.denoiser(r_spatial)).view(B, H * W)
         return x_new.clamp(0.0, 1.0)
