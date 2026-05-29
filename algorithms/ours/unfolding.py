@@ -26,4 +26,6 @@ class ISTAStep(nn.Module):
         # Proximal operator via U-Net
         B = x.shape[0]
         x_new = self.denoiser(r.view(B, 1, H, W)).view(B, H * W)
-        return x_new
+        # Enforce physical bounds: pixel values must stay in [0, 1]
+        # Prevents extreme intermediate values from cascading across stages
+        return x_new.clamp(0.0, 1.0)
