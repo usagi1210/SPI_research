@@ -158,6 +158,45 @@ class LoRADUNCond(nn.Module):
         return x.view(B, 1, H, W)
 
 
+class LoRADUNDR(nn.Module):
+    """Stage 4: Dynamic Rank LoRA.
+
+    Each unrolled stage gets its own rank from a preset sequence.
+    Default: decreasing [8,8,6,6,4,4,2,2,1,1] — early stages need more
+    expressivity for coarse reconstruction, later stages need less.
+    """
+
+    def __init__(self, num_stages: int = 10, channels=(32, 64, 128),
+                 patch_size: int = 64,
+                 ranks=(8, 8, 6, 6, 4, 4, 2, 2, 1, 1)):
+        super().__init__()
+        assert len(ranks) == num_stages, "len(ranks) must equal num_stages"
+        self.num_stages = num_stages
+        self.patch_size = patch_size
+        self.backbone   = LightUNet(channels)
+        self.lora_banks = nn.ModuleList(
+            [LoRABank(channels, rank=r) for r in ranks]
+        )
+        self.alphas = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.1)) for _ in range(num_stages)]
+        )
+
+    def forward(self, y: torch.Tensor, Phi: torch.Tensor) -> torch.Tensor:
+        H = W = self.patch_size
+        B = y.shape[0]
+        x = y @ Phi
+
+        for k in range(self.num_stages):
+            Phix      = x @ Phi.T
+            grad      = (Phix - y) @ Phi
+            r         = x - self.alphas[k] * grad
+            r_spatial = r.view(B, 1, H, W)
+            x = (r_spatial + unet_with_lora(self.backbone, self.lora_banks[k],
+                                            r_spatial)).view(B, H * W).clamp(0., 1.)
+
+        return x.view(B, 1, H, W)
+
+
 def build_model(cfg: dict) -> nn.Module:
     name = cfg.get('model_name', 'BaseDUN')
     kwargs = dict(
@@ -175,4 +214,7 @@ def build_model(cfg: dict) -> nn.Module:
         return LoRADUNCond(**kwargs, rank=cfg.get('lora_rank', 4), condition_type='re')
     if name == 'LoRADUNCondMC':
         return LoRADUNCond(**kwargs, rank=cfg.get('lora_rank', 4), condition_type='mc')
+    if name == 'LoRADUNDR':
+        ranks = tuple(cfg.get('lora_ranks', [8, 8, 6, 6, 4, 4, 2, 2, 1, 1]))
+        return LoRADUNDR(**kwargs, ranks=ranks)
     raise ValueError(f'Unknown model: {name}')

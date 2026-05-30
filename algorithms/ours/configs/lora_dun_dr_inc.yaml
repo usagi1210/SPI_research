@@ -1,0 +1,31 @@
+# Stage 4: LoRA-DUN-DR, 递增秩序列 [1,1,2,2,4,4,6,6,8,8]
+# 早期 stage 低秩，后期 stage 高秩（消融对比递减版）
+
+model_name: LoRADUNDR
+num_stages: 10
+channels: [32, 64, 128]
+patch_size: 64
+lora_ranks: [1, 1, 2, 2, 4, 4, 6, 6, 8, 8]
+
+# Training
+epochs: 200
+batch_size: 32
+lr: 1.0e-3
+lr_min: 1.0e-5
+scheduler: cosine
+loss: l1
+recon_weight: 1.0
+consistency_weight: 0.0
+patches_per_image: 50
+
+train_dir: ../../data/train/BSD400
+val_dir:   ../../data/test/Set11
+matrix_dir: ../../matrices
+result_dir: ../../results/ours/lora_dun_dr_inc
+
+cr: 0.10
+
+val_every: 1
+save_freq: 10
+iter_step: 100
+num_workers: 4
