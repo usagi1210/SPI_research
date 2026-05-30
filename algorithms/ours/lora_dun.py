@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from backbone import LightUNet
 from unfolding import ISTAStep
-from lora import LoRABank, ConditionMLP, unet_with_lora
+from lora import LoRABank, ConditionMLP, GateMLP, unet_with_lora, unet_with_gated_lora
 
 
 class BaseDUN(nn.Module):
@@ -197,6 +197,59 @@ class LoRADUNDR(nn.Module):
         return x.view(B, 1, H, W)
 
 
+class LoRADUNGate(nn.Module):
+    """Stage 5: Gated Dynamic Rank LoRA.
+
+    Per-stage gate g^(k) ∈ (0,1) scales the LoRA contribution in feature space:
+        output^(k) = backbone(r^k) + g^(k) · LoRA_k(r^k)
+
+    g^(k) = Sigmoid(GateMLP_k(e^(k))),  e^(k) = mean(||Φx^k - y||²)
+
+    When g→0: stage behaves as Shared-DUN (LoRA suppressed).
+    When g→1: stage behaves as LoRADUNDR (full LoRA).
+    Initialized at g ≈ 1 so training starts identical to Stage 4.
+    """
+
+    def __init__(self, num_stages: int = 10, channels=(32, 64, 128),
+                 patch_size: int = 64,
+                 ranks=(1, 1, 2, 2, 4, 4, 6, 6, 8, 8)):
+        super().__init__()
+        assert len(ranks) == num_stages
+        self.num_stages = num_stages
+        self.patch_size = patch_size
+        self.backbone   = LightUNet(channels)
+        self.lora_banks = nn.ModuleList(
+            [LoRABank(channels, rank=r) for r in ranks]
+        )
+        self.alphas = nn.ParameterList(
+            [nn.Parameter(torch.tensor(0.1)) for _ in range(num_stages)]
+        )
+        self.gate_mlps = nn.ModuleList(
+            [GateMLP() for _ in range(num_stages)]
+        )
+
+    def forward(self, y: torch.Tensor, Phi: torch.Tensor) -> torch.Tensor:
+        H = W = self.patch_size
+        B = y.shape[0]
+        x = y @ Phi
+
+        for k in range(self.num_stages):
+            Phix     = x @ Phi.T
+            residual = Phix - y
+            grad     = residual @ Phi
+            r        = x - self.alphas[k] * grad
+
+            e_k      = (residual ** 2).mean(dim=1)        # (B,) residual energy
+            g_k      = self.gate_mlps[k](e_k)             # (B,) ∈ (0, 1)
+
+            r_spatial = r.view(B, 1, H, W)
+            x = (r_spatial + unet_with_gated_lora(
+                    self.backbone, self.lora_banks[k], r_spatial, g_k)
+                 ).view(B, H * W).clamp(0., 1.)
+
+        return x.view(B, 1, H, W)
+
+
 def build_model(cfg: dict) -> nn.Module:
     name = cfg.get('model_name', 'BaseDUN')
     kwargs = dict(
@@ -217,4 +270,7 @@ def build_model(cfg: dict) -> nn.Module:
     if name == 'LoRADUNDR':
         ranks = tuple(cfg.get('lora_ranks', [8, 8, 6, 6, 4, 4, 2, 2, 1, 1]))
         return LoRADUNDR(**kwargs, ranks=ranks)
+    if name == 'LoRADUNGate':
+        ranks = tuple(cfg.get('lora_ranks', [1, 1, 2, 2, 4, 4, 6, 6, 8, 8]))
+        return LoRADUNGate(**kwargs, ranks=ranks)
     raise ValueError(f'Unknown model: {name}')
