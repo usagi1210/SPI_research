@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from backbone import LightUNet
 from unfolding import ISTAStep
-from lora import LoRABank, ConditionMLP, GateMLP, unet_with_lora, unet_with_gated_lora
+from lora import LoRABank, ConditionMLP, GateMLP, unet_with_lora
 
 
 class BaseDUN(nn.Module):
@@ -200,14 +200,19 @@ class LoRADUNDR(nn.Module):
 class LoRADUNGate(nn.Module):
     """Stage 5: Gated Dynamic Rank LoRA.
 
-    Per-stage gate g^(k) ∈ (0,1) scales the LoRA contribution in feature space:
-        output^(k) = backbone(r^k) + g^(k) · LoRA_k(r^k)
+    Per-stage gate g^(k) ∈ (0,1) controls how much LoRA contributes:
+        backbone_out = backbone(r^k)
+        lora_out     = unet_with_lora(backbone, LoRA_k, r^k)
+        output       = backbone_out + g^(k) · (lora_out - backbone_out)
 
     g^(k) = Sigmoid(GateMLP_k(e^(k))),  e^(k) = mean(||Φx^k - y||²)
 
-    When g→0: stage behaves as Shared-DUN (LoRA suppressed).
+    When g→0: stage behaves as Shared-DUN (LoRA suppressed, backbone only).
     When g→1: stage behaves as LoRADUNDR (full LoRA).
     Initialized at g ≈ 1 so training starts identical to Stage 4.
+
+    Gate is applied at the stage output level (not per-layer) to avoid
+    training instability from per-sample gating inside conv layers.
     """
 
     def __init__(self, num_stages: int = 10, channels=(32, 64, 128),
@@ -239,13 +244,16 @@ class LoRADUNGate(nn.Module):
             grad     = residual @ Phi
             r        = x - self.alphas[k] * grad
 
-            e_k      = (residual ** 2).mean(dim=1)        # (B,) residual energy
-            g_k      = self.gate_mlps[k](e_k)             # (B,) ∈ (0, 1)
+            e_k = (residual ** 2).mean(dim=1)          # (B,)
+            g_k = self.gate_mlps[k](e_k).view(B, 1, 1, 1)  # (B,1,1,1) ∈ (0,1)
 
-            r_spatial = r.view(B, 1, H, W)
-            x = (r_spatial + unet_with_gated_lora(
-                    self.backbone, self.lora_banks[k], r_spatial, g_k)
-                 ).view(B, H * W).clamp(0., 1.)
+            r_spatial    = r.view(B, 1, H, W)
+            backbone_out = self.backbone(r_spatial)
+            lora_out     = unet_with_lora(self.backbone, self.lora_banks[k], r_spatial)
+            # Interpolate: g=1 → full LoRA, g=0 → backbone only
+            out = backbone_out + g_k * (lora_out - backbone_out)
+
+            x = (r_spatial + out).view(B, H * W).clamp(0., 1.)
 
         return x.view(B, 1, H, W)
 
