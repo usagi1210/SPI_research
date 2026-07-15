@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from dataset import BSD400Dataset, load_test_image
 from full_model import build_full_model, compression_ratio
 

@@ -15,9 +15,9 @@ loss: l1
 consistency_weight: 0.01
 patches_per_image: 20
 
-train_dir: ../../data/train/BSD400
-val_dir: ../../data/test/Set11
-result_dir: ../../results/ours/full_shared_dun_tiny
+train_dir: ../../../data/train/BSD400
+val_dir: ../../../data/test/Set11
+result_dir: ../../../results/ours/full_shared_dun_tiny
 
 val_every: 1
 save_freq: 10
