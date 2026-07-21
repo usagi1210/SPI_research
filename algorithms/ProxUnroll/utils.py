@@ -1,0 +1,239 @@
+import torch
+from torch.utils.data import Dataset 
+import scipy.io as scio
+import numpy as np
+from torch import nn 
+import logging 
+import time 
+import os
+import os.path as osp
+import csv
+import cv2
+import math 
+import albumentations
+import einops
+from sklearn.metrics import mean_squared_error as MSE
+
+
+TRAIN_SIZE_PRESETS = {
+    '256_321': [(256, 256), (321, 481)],
+    '256_321_512': [(256, 256), (321, 481), (512, 512)],
+}
+
+
+class TrainData(Dataset):
+    def __init__(self, train_data_path, train_sizes='256_321_512'):
+        if train_sizes not in TRAIN_SIZE_PRESETS:
+            raise ValueError(
+                "train_sizes must be one of {}, got {!r}".format(
+                    list(TRAIN_SIZE_PRESETS.keys()), train_sizes,
+                )
+            )
+        self.img_path = train_data_path
+        self.sizes = TRAIN_SIZE_PRESETS[train_sizes]
+        self.train_sizes = train_sizes
+        repeats = 25
+        img_names = os.listdir(self.img_path)
+        self.img_names = img_names * repeats
+
+    def __getitem__(self, index):
+        image = cv2.imread(os.path.join(self.img_path, self.img_names[index]))
+        image_h, image_w = image.shape[:2]
+        if image_h > image_w:
+            image = cv2.flip(image, 1)
+            image = cv2.transpose(image)
+            image_h, image_w = image.shape[:2]
+
+        crop_flag = np.random.randint(1, 10)
+        crop_h = np.random.randint(image_h // 2, image_h)
+        if crop_flag <= 3:
+            crop_w = np.random.randint(image_w // 2, image_w)
+        elif crop_flag <= 6:
+            crop_w = crop_h
+        else:
+            crop_w = int(crop_h * (481 / 321))
+
+        transform = albumentations.Compose([
+            albumentations.RandomCrop(height=crop_h, width=crop_w, p=0.95),
+            albumentations.HorizontalFlip(p=0.5),
+            albumentations.VerticalFlip(p=0.5),
+        ])
+        image = transform(image=image)['image']
+
+        gts = []
+        for size_h, size_w in self.sizes:
+            resized = albumentations.Resize(size_h, size_w)(image=image)['image']
+            y = cv2.cvtColor(resized, cv2.COLOR_BGR2YCrCb)[:, :, 0]
+            gts.append(y.astype(np.float32) / 255.)
+        return gts
+
+    def __len__(self,):
+        return len(self.img_names)
+
+        
+class TestData(Dataset):
+    def __init__(self,test_data_path):
+        self.data_path = test_data_path
+        self.data_list = sorted(os.listdir(self.data_path))
+
+    def __getitem__(self,index):
+        pic = cv2.imread(os.path.join(self.data_path,self.data_list[index]))
+        pic = cv2.cvtColor(pic,cv2.COLOR_BGR2YCrCb)
+        gt = pic.astype(np.float32) / 255.
+        return gt
+    def __len__(self,):
+        return len(self.data_list)
+
+def ssim(img1, img2):
+    C1 = (0.01 * 255) ** 2
+    C2 = (0.03 * 255) ** 2
+
+    img1 = img1.astype(np.float64)
+    img2 = img2.astype(np.float64)
+    kernel = cv2.getGaussianKernel(11, 1.5)
+    window = np.outer(kernel, kernel.transpose())
+
+    mu1 = cv2.filter2D(img1, -1, window)[5:-5, 5:-5]  # valid
+    mu2 = cv2.filter2D(img2, -1, window)[5:-5, 5:-5]
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+    sigma1_sq = cv2.filter2D(img1 ** 2, -1, window)[5:-5, 5:-5] - mu1_sq
+    sigma2_sq = cv2.filter2D(img2 ** 2, -1, window)[5:-5, 5:-5] - mu2_sq
+    sigma12 = cv2.filter2D(img1 * img2, -1, window)[5:-5, 5:-5] - mu1_mu2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) *
+                                                            (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean()
+
+def compare_ssim(img1, img2):
+    '''calculate SSIM
+    the same outputs as MATLAB's
+    img1, img2: [0, 255]
+    '''
+    if not img1.shape == img2.shape:
+        raise ValueError('Input images must have the same dimensions.')
+    if img1.ndim == 2:
+        return ssim(img1, img2)
+    elif img1.ndim == 3:
+        if img1.shape[2] == 3:
+            ssims = []
+            for i in range(3):
+                ssims.append(ssim(img1, img2))
+            return np.array(ssims).mean()
+        elif img1.shape[2] == 1:
+            return ssim(np.squeeze(img1), np.squeeze(img2))
+
+def compare_psnr(img1, img2, shave_border=0):
+    height, width = img1.shape[:2]
+    img1 = img1[shave_border:height - shave_border, shave_border:width - shave_border]
+    img2 = img2[shave_border:height - shave_border, shave_border:width - shave_border]
+    imdff = img1 - img2
+    rmse = math.sqrt(np.mean(imdff ** 2))
+    if rmse == 0:
+        return 100
+    return 20 * math.log10(255.0 / rmse)
+
+
+def time2file_name(time):
+    year = time[0:4]
+    month = time[5:7]
+    day = time[8:10]
+    hour = time[11:13]
+    minute = time[14:16]
+    second = time[17:19]
+    time_filename = year + '_' + month + '_' + day + '_' + hour + '_' + minute + '_' + second
+    return time_filename
+
+
+def format_cr(cr):
+    """Return the percentage label used by the shared experiment layout."""
+    return str(int(round(float(cr) * 100)))
+
+
+def create_run_layout(result_dir, model_name, cr_label, run_id=None):
+    """Create the standardized result tree for a train or evaluation run."""
+    if run_id is None:
+        run_id = time.strftime('%Y%m%d_%H%M%S')
+    run_name = '{}-cr{}--{}'.format(model_name, cr_label, run_id)
+    base_dir = os.path.join(result_dir, run_name)
+    layout = {
+        'base_dir': base_dir,
+        'checkpoints': os.path.join(base_dir, 'checkpoints'),
+        'logs': os.path.join(base_dir, 'logs'),
+        'vis': os.path.join(base_dir, 'vis'),
+        'run_id': run_id,
+        'run_name': run_name,
+    }
+    for key in ('base_dir', 'checkpoints', 'logs', 'vis'):
+        os.makedirs(layout[key], exist_ok=True)
+    return layout
+
+
+def save_per_image_metrics(psnr_dict, ssim_dict, output_path):
+    """Save image-level reconstruction metrics in the common CSV format."""
+    names = sorted(psnr_dict.keys())
+    with open(output_path, 'w', newline='', encoding='utf-8') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(['image', 'psnr_db', 'ssim'])
+        for name in names:
+            writer.writerow([name, '{:.4f}'.format(psnr_dict[name]), '{:.6f}'.format(ssim_dict[name])])
+        if names:
+            writer.writerow([
+                'MEAN',
+                '{:.4f}'.format(float(np.mean([psnr_dict[name] for name in names]))),
+                '{:.6f}'.format(float(np.mean([ssim_dict[name] for name in names]))),
+            ])
+
+
+def Logger(log_path):
+    """Create an isolated logger, accepting either a log path or a directory."""
+    if os.path.splitext(log_path)[1]:
+        logfile = log_path
+        log_parent = os.path.dirname(logfile)
+        if log_parent:
+            os.makedirs(log_parent, exist_ok=True)
+    else:
+        os.makedirs(log_path, exist_ok=True)
+        localtime = time.strftime('%Y%m%d_%H%M%S')
+        logfile = os.path.join(log_path, localtime + '.log')
+
+    logger = logging.getLogger('proxunroll.{}'.format(os.path.abspath(logfile)))
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+    logger.handlers.clear()
+    formatter = logging.Formatter('%(asctime)s - %(filename)s [line: %(lineno)s] - %(message)s')
+
+    fh = logging.FileHandler(logfile, mode='w')
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(formatter)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    ch.setFormatter(formatter)
+
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    return logger 
+
+def checkpoint(epoch, model, optimizer, model_out_path, scheduler=None):
+    state = {
+        'pretrain_epoch': epoch,
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+    }
+    if scheduler is not None:
+        state['scheduler'] = scheduler.state_dict()
+    torch.save(state, model_out_path)
+
+
+def load_checkpoint(model, pretrained_dict, logger, optimizer=None, scheduler=None):
+    model_dict = model.state_dict()
+    pretrained_model_dict = pretrained_dict['state_dict']
+    load_dict = {k: p for k, p in pretrained_model_dict.items() if k in model_dict.keys()}
+    model_dict.update(load_dict)
+    model.load_state_dict(model_dict)
+    if optimizer is not None and 'optimizer' in pretrained_dict:
+        optimizer.load_state_dict(pretrained_dict['optimizer'])
+    if scheduler is not None and 'scheduler' in pretrained_dict:
+        scheduler.load_state_dict(pretrained_dict['scheduler'])

@@ -1,0 +1,2 @@
+# Pretrained checkpoints are transferred to the server separately.
+weight/*.pth
